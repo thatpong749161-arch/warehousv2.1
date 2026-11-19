@@ -1,0 +1,10 @@
+{
+  "name": "device-loan-tracker",
+  "version": "2.0.0",
+  "private": true,
+  "description": "ระบบเบิก/คืนเครื่อง — คำขอเบิกตามรุ่น/จำนวน · สต็อก · สแกน IMEI ตอนจ่าย — PWA + Supabase บน Vercel",
+  "scripts": {
+    "build": "node build.js",
+    "dev": "npx serve public"
+  }
+}
