@@ -2,7 +2,7 @@
 //  • ไฟล์ของแอป (same-origin): network-first — ออนไลน์ได้ไฟล์ล่าสุดเสมอหลัง deploy, ออฟไลน์ใช้ที่แคชไว้
 //  • ไลบรารี/ฟอนต์จาก CDN: cache-first (ระบุเวอร์ชันใน URL อยู่แล้ว)
 //  • คำขอไป Supabase ไม่ผ่าน SW เลย
-const VER = 'loan-v4';
+const VER = 'loan-v5';
 // ไม่แคช 'index.html' ตรง ๆ เพราะ vercel.json เปิด cleanUrls (/index.html → 308 ไป /) — ใช้ './' แทน
 const SHELL = ['./', 'style.css', 'app.js', 'config.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 const CDN = ['cdn.jsdelivr.net', 'unpkg.com', 'cdnjs.cloudflare.com', 'fonts.googleapis.com', 'fonts.gstatic.com'];

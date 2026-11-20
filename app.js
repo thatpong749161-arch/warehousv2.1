@@ -11,10 +11,10 @@ const DOC_T = { ISSUE: 'จ่าย', RETURN: 'คืน' };
 const DOC_CLS = { ISSUE: 'warn', RETURN: 'ok' };
 const REQ_T = { PENDING: 'รอจ่าย', ISSUED: 'จ่ายแล้ว', CANCELLED: 'ยกเลิก' };
 const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
-const MOVE_T = { INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
+const MOVE_T = { SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '2.1.1';
+const APP_VER = '2.2.0';
 
 /* ---------- Supabase ---------- */
 const cfg = window.APP_CONFIG || {};
@@ -494,7 +494,7 @@ function viewStock() {
 }
 
 /* ประวัติเอกสาร */
-const docSummary = d => { const n = d.document_items.length, f = d.document_items[0]; return n ? `${esc(f.model ? f.model + ' · ' : '')}${esc(f.imei)}${n > 1 ? ` และอีก ${n - 1} เครื่อง` : ''}` : ''; };
+const docSummary = d => { const n = d.document_items.length, f = d.document_items[0]; return (n ? `${esc(f.model ? f.model + ' · ' : '')}${esc(f.imei)}${n > 1 ? ` และอีก ${n - 1} เครื่อง` : ''}` : '') + (d.sold?.length ? `${n ? ' · ' : ''}ขาย ${d.sold.length} เครื่อง` : ''); };
 function historyListHtml() {
   const q = state.hq.trim().toLowerCase(), t = state.ht;
   const list = state.docs.filter(d => (!t || d.type === t) && (!q || [d.doc_no, d.req_no, d.person, d.dept, d.purpose, d.note, ...d.document_items.flatMap(i => [i.imei, i.model])].some(x => String(x || '').toLowerCase().includes(q))));
@@ -591,27 +591,38 @@ const commitFul = () => guarded(async () => {
   await refresh(); state.view = 'requests'; render(); toast('บันทึกการจ่าย ' + doc); showDoc(doc);
 });
 const REASONS = ['ผู้เบิกยังใช้งานอยู่', 'ยังไม่ได้นำมาคืน', 'ส่งซ่อม', 'เครื่องเสียหาย', 'สูญหาย'];
+let retSold = new Set(), retReason = '';
 function commitReturn() {
-  if (!state.cart.return.length) return toast('ยังไม่ได้ยิงเครื่องที่คืน', true);
+  if (!state.retPerson) return toast('เลือกผู้เบิก หรือยิง IMEI ก่อน', true);
   const miss = retMissing();
-  if (!miss.length) return doReturn([], '');
-  showDialog(`<h2>มีเครื่องที่ยังไม่ได้ยิงคืน ${miss.length} เครื่อง</h2>
-    <p class="muted" style="margin-bottom:8px">${esc(state.retPerson)} · คืน ${state.cart.return.length} จาก ${retLoans().length} เครื่อง — กรุณาระบุเหตุผลของเครื่องที่ยังไม่คืน</p>
-    <div class="misslist">${miss.map(l => `<div><b class="code">${esc(l.imei)}</b> <small style="display:inline">${esc(l.model || '-')}</small></div>`).join('')}</div>
-    <label style="margin-top:12px">เหตุผล *<input id="missReason" placeholder="เช่น ผู้เบิกยังใช้งานอยู่" autocomplete="off"></label>
-    <div class="chips" style="margin:-4px 0 12px">${REASONS.map(r => `<button class="rchip" data-act="pickReason" data-v="${esc(r)}">${esc(r)}</button>`).join('')}</div>
-    <button class="primary big" data-act="confirmReturn" style="margin-top:0">ยืนยันรับคืน ${state.cart.return.length} เครื่อง</button>
-    <button class="big" data-act="closeDlg">กลับไปยิงต่อ</button>`);
-  setTimeout(() => $('#missReason')?.focus(), 60);
+  if (!miss.length) return doReturn([], '', []);
+  retSold = new Set(); retReason = '';
+  renderMissDlg();
 }
-const doReturn = (missing, reason) => guarded(async () => {
+// แต่ละเครื่องที่ไม่ได้ยิง: กด “ขาย” = ปิดรายการ ไม่คืนสต็อก · ที่เหลือ = ยังค้าง ต้องมีเหตุผล
+function renderMissDlg() {
+  const reasonEl = $('#missReason'); if (reasonEl) retReason = reasonEl.value;
+  const miss = retMissing(), sold = miss.filter(l => retSold.has(l.imei)), keep = miss.filter(l => !retSold.has(l.imei));
+  const n = state.cart.return.length;
+  const parts = [n && `คืน ${n}`, sold.length && `ขาย ${sold.length}`, keep.length && `ค้างต่อ ${keep.length}`].filter(Boolean).join(' · ');
+  showDialog(`<h2>ไม่ได้ยิงคืน ${miss.length} เครื่อง</h2>
+    <p class="muted" style="margin-bottom:8px">${esc(state.retPerson)} — เครื่องที่ <b>ขายแล้ว</b> กด “ขาย” (ไม่ต้องยิง และไม่คืนเข้าสต็อก) · ที่เหลือจะค้างต่อ ต้องใส่เหตุผล</p>
+    <div class="misslist">${miss.map(l => { const on = retSold.has(l.imei); return `<div class="mrow ${on ? 'sold' : ''}"><div class="grow"><b class="code">${esc(l.imei)}</b><small>${esc(l.model || '-')}</small></div>
+      <button class="soldbtn ${on ? 'on' : ''}" data-act="toggleSold" data-imei="${esc(l.imei)}">${on ? '✓ ขายแล้ว' : 'ขาย?'}</button></div>`; }).join('')}</div>
+    ${miss.length > 1 ? `<button data-act="soldAll" style="width:100%;margin-top:8px">${sold.length === miss.length ? 'ยกเลิกขายทั้งหมด' : `ขายทั้งหมด ${miss.length} เครื่อง`}</button>` : ''}
+    ${keep.length ? `<label style="margin-top:12px">เหตุผลของเครื่องที่ยังค้าง (${keep.length} เครื่อง) *<input id="missReason" value="${esc(retReason)}" placeholder="เช่น ผู้เบิกยังใช้งานอยู่" autocomplete="off"></label>
+    <div class="chips" style="margin:-4px 0 12px">${REASONS.map(r => `<button class="rchip" data-act="pickReason" data-v="${esc(r)}">${esc(r)}</button>`).join('')}</div>` : '<div style="height:12px"></div>'}
+    <button class="primary big" data-act="confirmReturn" style="margin-top:0">ยืนยัน: ${parts || '-'}</button>
+    <button class="big" data-act="closeDlg">กลับไปยิงต่อ</button>`);
+}
+const doReturn = (missing, reason, sold) => guarded(async () => {
   const cart = state.cart.return;
   let doc;
-  try { doc = await rpc('dev_return', { p_imeis: cart.map(l => l.imei), p_by: opName(), p_note: state.rnote.trim(), p_missing: missing, p_reason: reason }); }
+  try { doc = await rpc('dev_return', { p_imeis: cart.map(l => l.imei), p_by: opName(), p_note: state.rnote.trim(), p_missing: missing, p_reason: reason, p_sold: sold }); }
   catch (e) { await refresh(); renderRet(); throw e; }
   if (dlg().open) dlg().close();
   state.cart.return = []; state.rnote = ''; state.retPerson = ''; saveDraft();
-  await refresh(); render(); toast('บันทึกการคืน ' + doc); showDoc(doc);
+  await refresh(); render(); toast('บันทึกแล้ว ' + doc); showDoc(doc);
 });
 
 /* ---------- dialogs ---------- */
@@ -654,6 +665,7 @@ async function showDoc(no) {
     <table><tr><th>IMEI</th><th>รุ่น</th>${iss && isIssuer() ? '<th class="r">สถานะ</th>' : ''}</tr>
     ${d.document_items.map(i => `<tr><td>${esc(i.imei)}</td><td>${esc(i.model || '-')}</td>${iss && isIssuer() ? `<td class="r">${state.openMap.get(i.imei)?.issue_doc === d.doc_no ? '<span class="badge warn">ค้าง</span>' : '<span class="badge ok">คืนแล้ว</span>'}</td>` : ''}</tr>`).join('')}</table>
     <p class="muted" style="margin-top:8px">รวม ${d.document_items.length} เครื่อง</p>
+    ${d.sold?.length ? `<div class="missbox sold"><b>ขายแล้ว ${d.sold.length} เครื่อง</b> (ปิดรายการ ไม่คืนสต็อก)<div class="chips">${d.sold.map(m => `<span class="chip" style="padding-right:8px">${esc(m.imei)}</span>`).join('')}</div></div>` : ''}
     ${d.missing?.length ? `<div class="missbox"><b>ยังไม่คืน ${d.missing.length} เครื่อง</b> — เหตุผล: ${esc(d.missing_reason)}<div class="chips">${d.missing.map(m => `<span class="chip" style="padding-right:8px">${esc(m.imei)}</span>`).join('')}</div></div>` : ''}
     <div class="row" style="margin-top:12px"><button data-act="printDoc" data-no="${esc(d.doc_no)}" data-mode="table">🖨️ พิมพ์ทั้งใบ</button><button data-act="printDoc" data-no="${esc(d.doc_no)}" data-mode="slip">🖨️ แยกทีละเครื่อง</button></div>
     <button class="primary big" data-act="closeDlg" style="margin-top:0">ปิด</button>`);
@@ -784,7 +796,8 @@ table.ct{table-layout:fixed}
 .miss{margin-top:14px;border:1px solid #f2d16b;background:#fffaeb;border-radius:10px;padding:9px 14px;break-inside:avoid}
 .miss .mh{font-weight:700;font-size:12px}.miss .mh span{font-weight:500;color:var(--mut);margin-left:6px}
 .miss .mi{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:4px;font-size:11px}
-.miss .mi span{font-family:"IBM Plex Mono",monospace}`;
+.miss .mi span{font-family:"IBM Plex Mono",monospace}
+.miss.sold{border-color:#9dbbe0;background:#eef4fb}`;
 function openWin() {
   const w = window.open('', '_blank');
   if (!w) { toast('เบราว์เซอร์บล็อกหน้าต่างพิมพ์', true); return null; }
@@ -832,15 +845,19 @@ async function printDoc(no, mode = 'table') {
     const pills = `<div class="sumrow">${[...groups].map(([m, a]) => `<span class="pill">${esc(m)}<b>${a.length}</b></span>`).join('')}</div>`;
     const miss = !iss && d.missing?.length ? `<div class="miss"><div class="mh">เครื่องที่ยังไม่คืน ${d.missing.length} เครื่อง<span>เหตุผล: ${esc(d.missing_reason)}</span></div>
       <div class="mi">${d.missing.map(m => `<span>${esc(imeiFmt(m.imei))} · ${esc(m.model || '-')}</span>`).join('')}</div></div>` : '';
+    const sold = !iss && d.sold?.length ? `<div class="miss sold"><div class="mh">ขายแล้ว ${d.sold.length} เครื่อง<span>ปิดรายการ ไม่คืนเข้าสต็อก</span></div>
+      <div class="mi">${d.sold.map(m => `<span>${esc(imeiFmt(m.imei))} · ${esc(m.model || '-')}</span>`).join('')}</div></div>` : '';
     const head = sheetHead({ title, en, no: d.doc_no, sub: `${n} เครื่อง · ${groups.size} รุ่น${d.req_no ? ' · อ้างอิงคำขอ ' + esc(d.req_no) : ''}` });
-    if (n + (groups.size > 1 ? groups.size : 0) <= 12) { // แบบตารางใหญ่ (มีช่องสภาพ/หมายเหตุ)
+    if (!n) {
+      body = `<section>${sheetHead({ title, en, no: d.doc_no, sub: 'ไม่มีเครื่องคืนเข้าคลัง' })}${metaGrid(metaCells, 4)}${sold}${miss}${sign}</section>`;
+    } else if (n + (groups.size > 1 ? groups.size : 0) <= 12) { // แบบตารางใหญ่ (มีช่องสภาพ/หมายเหตุ)
       let k = 0;
       body = `<section>${head}${metaGrid(metaCells, 4)}${pills}
       <table><thead><tr><th class="n">#</th><th>IMEI / ซีเรียล</th><th>รุ่นเครื่อง</th><th style="width:30%">สภาพ / หมายเหตุ</th></tr></thead><tbody>
       ${[...groups].map(([m, a]) => (groups.size > 1 ? `<tr class="grp"><td colspan="4">${esc(m)} <span>· ${a.length} เครื่อง</span></td></tr>` : '')
         + a.map(it => `<tr><td class="n">${String(++k).padStart(2, '0')}</td><td class="imei">${esc(imeiFmt(it.imei))}</td><td>${esc(it.model || '-')}</td><td></td></tr>`).join('')).join('')}
       </tbody></table>
-      <div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง</span></div>${miss}${sign}</section>`;
+      <div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง</span></div>${sold}${miss}${sign}</section>`;
     } else {
       // หน้าแรก 2×30 = 60 เครื่อง, หน้าถัดไป 2×46 = 92 เครื่อง
       const rows = items.map((it, i) => ({ ...it, k: i + 1 })), pages = [];
@@ -850,7 +867,7 @@ async function printDoc(no, mode = 'table') {
         ${rs.map(r => `<tr><td class="n">${String(r.k).padStart(2, '0')}</td><td class="imei">${esc(imeiFmt(r.imei))}</td><td title="${esc(r.model)}">${esc(r.model || '-')}</td><td class="c"><i class="box"></i></td></tr>`).join('')}</tbody></table>`;
       body = `<section class="cp">${head}${metaGrid(metaCells, 4)}${pills}
         ${pages.map((pg, pi) => { const h = Math.ceil(pg.length / 2); return `<div class="cgrid ${pi ? 'pb' : ''}">${pi ? `<div class="cont"><span>${title} · ${esc(d.doc_no)} (ต่อ)</span><span>${esc(d.person)}</span></div>` : ''}${ct(pg.slice(0, h))}${pg.length > h ? ct(pg.slice(h)) : '<div></div>'}</div>`; }).join('')}
-        <div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง · ${groups.size} รุ่น</span></div>${miss}${sign}</section>`;
+        <div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง · ${groups.size} รุ่น</span></div>${sold}${miss}${sign}</section>`;
     }
   }
   writePrint(w, d.doc_no, body);
@@ -861,10 +878,15 @@ const actions = {
   scan: d => openScanner(code => addImei(d.k, code), { multi: true }),
   del: d => { state.cart.return = state.cart.return.filter(x => x.imei !== d.imei); renderRet(); saveDraft(); },
   pickReason: d => { const i = $('#missReason'); if (i) { i.value = d.v; i.focus(); } },
+  toggleSold: d => { retSold.has(d.imei) ? retSold.delete(d.imei) : retSold.add(d.imei); renderMissDlg(); },
+  soldAll: () => { const m = retMissing(); retSold = m.every(l => retSold.has(l.imei)) ? new Set() : new Set(m.map(l => l.imei)); renderMissDlg(); },
   confirmReturn: () => {
+    const sold = retMissing().filter(l => retSold.has(l.imei)).map(l => l.imei);
+    const keep = retMissing().filter(l => !retSold.has(l.imei)).map(l => l.imei);
+    if (!state.cart.return.length && !sold.length) { toast('ยังไม่มีเครื่องที่คืนหรือขาย', true); return; }
     const reason = ($('#missReason')?.value || '').trim();
-    if (!reason) { const i = $('#missReason'); if (i) { i.setCustomValidity('กรุณาระบุเหตุผล หรือเลือกจากตัวเลือกด้านล่าง'); i.reportValidity(); i.oninput = () => i.setCustomValidity(''); } return; }
-    doReturn(retMissing().map(l => l.imei), reason);
+    if (keep.length && !reason) { const i = $('#missReason'); if (i) { i.setCustomValidity('กรุณาระบุเหตุผล หรือเลือกจากตัวเลือกด้านล่าง'); i.reportValidity(); i.oninput = () => i.setCustomValidity(''); } return; }
+    doReturn(keep, keep.length ? reason : '', sold);
   },
   retPerson: d => {
     if (state.retPerson !== d.p) { state.retPerson = d.p; state.cart.return = []; saveDraft(); }
@@ -928,7 +950,7 @@ const actions = {
     const rows = await fetchAll((a, b) => sb.from('loans').select('*').order('issued_at', { ascending: false }).order('id').range(a, b));
     const head = ['IMEI', 'รุ่น', 'ผู้เบิก', 'แผนก', 'วัตถุประสงค์', 'วันที่จ่าย', 'เลขที่คำขอ', 'เลขที่ใบจ่าย', 'ผู้จ่าย', 'สถานะ', 'วันที่คืน', 'เลขที่ใบคืน', 'ผู้รับคืน'];
     const lines = rows.map(l => [l.imei, l.model, l.person, l.dept, l.purpose, new Date(l.issued_at).toLocaleString('sv-SE'), l.req_no || '', l.issue_doc, l.issued_by,
-      l.returned_at ? 'คืนแล้ว' : 'ค้างอยู่', l.returned_at ? new Date(l.returned_at).toLocaleString('sv-SE') : '', l.return_doc || '', l.returned_by || '']);
+      l.returned_at ? (l.closed_reason === 'SOLD' ? 'ขายแล้ว' : 'คืนแล้ว') : 'ค้างอยู่', l.returned_at ? new Date(l.returned_at).toLocaleString('sv-SE') : '', l.return_doc || '', l.returned_by || '']);
     download('loans-' + new Date().toISOString().slice(0, 10) + '.csv', '﻿' + [head, ...lines].map(r => r.map(csvCell).join(',')).join('\r\n'), 'text/csv');
   })
 };

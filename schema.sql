@@ -122,6 +122,9 @@ alter table public.documents add column if not exists req_no   text not null def
 alter table public.documents add column if not exists missing        jsonb not null default '[]';
 alter table public.documents add column if not exists missing_reason text  not null default '';
 alter table public.loans     add column if not exists last_note      text  not null default '';
+-- ปิดรายการแบบไหน: RETURN = คืนเข้าคลัง (สต็อก +1), SOLD = ขายแล้ว (ไม่คืนสต็อก — ตัดไปตั้งแต่ตอนจ่าย)
+alter table public.loans     add column if not exists closed_reason  text  not null default '';
+alter table public.documents add column if not exists sold           jsonb not null default '[]';
 create index if not exists loans_req_idx on public.loans(req_no);
 
 -- ───────── ผู้ใช้ / สิทธิ์ ─────────
@@ -317,28 +320,31 @@ begin
   return v_no;
 end $$;
 
--- ───────── รับคืน (ผู้จ่ายเบิก) — atomic + คืนสต็อก ─────────
--- p_imeis   : เครื่องที่ยิงคืน
--- p_missing : เครื่องของผู้เบิกที่ยังไม่ได้คืนในรอบนี้ (ต้องมี p_reason)
+-- ───────── รับคืน / ขาย (ผู้จ่ายเบิก) — atomic ─────────
+-- p_imeis   : เครื่องที่ยิงคืน → ปิดรายการ + คืนสต็อก
+-- p_sold    : เครื่องที่ขายแล้ว (ไม่ต้องยิง) → ปิดรายการ ไม่คืนสต็อก
+-- p_missing : เครื่องที่ยังค้างต่อ (ต้องมี p_reason)
 drop function if exists public.dev_return(text[],text,text);
+drop function if exists public.dev_return(text[],text,text,text[],text);
 create or replace function public.dev_return(
-  p_imeis text[], p_by text, p_note text, p_missing text[] default '{}', p_reason text default '')
+  p_imeis text[], p_by text, p_note text, p_missing text[] default '{}', p_reason text default '', p_sold text[] default '{}')
 returns text language plpgsql security definer set search_path = public as $$
 declare
   v_no text; v_imei text; l loans%rowtype; v_persons text[] := '{}'; v_person text; v_dept text := '';
   v_by text := coalesce(trim(p_by),''); v_reason text := coalesce(trim(p_reason),'');
-  v_missing text[]; v_bal int; rec record;
+  v_ret text[]; v_sold text[]; v_missing text[]; v_all text[]; v_bal int; rec record;
 begin
   if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
-  if p_imeis is null or array_length(p_imeis, 1) is null then raise exception 'ยังไม่มีเครื่องที่จะคืน'; end if;
+  select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_ret  from unnest(coalesce(p_imeis, '{}')) x where trim(x) <> '';
+  select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_sold from unnest(coalesce(p_sold, '{}')) x where trim(x) <> '';
   select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_missing
-  from unnest(coalesce(p_missing, '{}')) x where trim(x) <> '';
-  if array_length(v_missing, 1) > 0 and v_reason = '' then
-    raise exception 'กรุณาระบุเหตุผลของเครื่องที่ยังไม่คืน';
-  end if;
+  from unnest(coalesce(p_missing, '{}')) x where trim(x) <> '' and not (upper(trim(x)) = any(v_sold));
+  if cardinality(v_ret) = 0 and cardinality(v_sold) = 0 then raise exception 'ยังไม่มีเครื่องที่จะคืนหรือขาย'; end if;
+  if v_ret && v_sold then raise exception 'เครื่องที่ยิงคืนแล้ว ระบุว่าขายซ้ำไม่ได้'; end if;
+  if cardinality(v_missing) > 0 and v_reason = '' then raise exception 'กรุณาระบุเหตุผลของเครื่องที่ยังไม่คืน'; end if;
 
-  foreach v_imei in array p_imeis loop
-    v_imei := upper(trim(v_imei));
+  v_all := v_ret || v_sold;
+  foreach v_imei in array v_all loop
     select * into l from loans where imei = v_imei and returned_at is null for update;
     if not found then raise exception 'IMEI % ไม่ได้อยู่ในสถานะถูกเบิก', v_imei; end if;
     if not (l.person = any(v_persons)) then v_persons := v_persons || l.person; end if;
@@ -347,31 +353,40 @@ begin
   v_person := case when array_length(v_persons, 1) = 1 then v_persons[1] else 'หลายคน: ' || array_to_string(v_persons, ', ') end;
 
   v_no := next_doc_no('RET');
-  insert into documents(doc_no, type, person, dept, note, by_name, missing, missing_reason)
+  insert into documents(doc_no, type, person, dept, note, by_name, missing, missing_reason, sold)
   values (v_no, 'RETURN', v_person, case when array_length(v_persons,1) = 1 then v_dept else '' end,
           coalesce(trim(p_note),''), v_by,
           coalesce((select jsonb_agg(jsonb_build_object('imei', imei, 'model', model, 'issue_doc', issue_doc) order by id)
-                    from loans where imei = any(v_missing) and returned_at is null and not (imei = any(p_imeis))), '[]'),
-          case when array_length(v_missing, 1) > 0 then v_reason else '' end);
+                    from loans where imei = any(v_missing) and returned_at is null and not (imei = any(v_all))), '[]'),
+          case when cardinality(v_missing) > 0 then v_reason else '' end,
+          coalesce((select jsonb_agg(jsonb_build_object('imei', imei, 'model', model, 'issue_doc', issue_doc) order by id)
+                    from loans where imei = any(v_sold) and returned_at is null), '[]'));
 
-  foreach v_imei in array p_imeis loop
-    v_imei := upper(trim(v_imei));
-    update loans set returned_at = now(), return_doc = v_no, returned_by = v_by
-    where imei = v_imei and returned_at is null
-    returning * into l;
-    insert into document_items(doc_no, imei, model) values (v_no, v_imei, l.model);
-  end loop;
+  insert into document_items(doc_no, imei, model)
+  select v_no, imei, model from loans where imei = any(v_ret) and returned_at is null order by id;
+  update loans set returned_at = now(), return_doc = v_no, returned_by = v_by, closed_reason = 'RETURN'
+  where imei = any(v_ret) and returned_at is null;
+  update loans set returned_at = now(), return_doc = v_no, returned_by = v_by, closed_reason = 'SOLD',
+                   last_note = 'ขายแล้ว (' || v_no || ')'
+  where imei = any(v_sold) and returned_at is null;
 
-  if array_length(v_missing, 1) > 0 then
+  if cardinality(v_missing) > 0 then
     update loans set last_note = v_reason || ' (' || v_no || ')'
     where imei = any(v_missing) and returned_at is null;
   end if;
 
+  -- คืนเข้าคลัง → สต็อกเพิ่ม
   for rec in select model_id, count(*)::int as c from loans
-             where return_doc = v_no and model_id is not null group by model_id loop
+             where return_doc = v_no and closed_reason = 'RETURN' and model_id is not null group by model_id loop
     update models set stock = stock + rec.c where id = rec.model_id returning stock into v_bal;
     insert into stock_moves(model_id, delta, balance, reason, ref, by_name)
     values (rec.model_id, rec.c, v_bal, 'RETURN', v_no, v_by);
+  end loop;
+  -- ขาย → สต็อกไม่เปลี่ยน (ตัดไปตอนจ่ายแล้ว) บันทึกไว้ในประวัติเพื่อตรวจสอบ
+  for rec in select model_id, count(*)::int as c from loans
+             where return_doc = v_no and closed_reason = 'SOLD' and model_id is not null group by model_id loop
+    insert into stock_moves(model_id, delta, balance, reason, ref, note, by_name)
+    values (rec.model_id, 0, (select stock from models where id = rec.model_id), 'SOLD', v_no, 'ขาย ' || rec.c || ' เครื่อง', v_by);
   end loop;
   return v_no;
 end $$;
@@ -431,7 +446,7 @@ revoke all on function public.stock_adjust(bigint,text,int,text,text)          f
 revoke all on function public.req_create(text,text,text,text,text,jsonb)       from public, anon;
 revoke all on function public.req_cancel(text,text)                            from public, anon;
 revoke all on function public.req_fulfill(text,text,jsonb)                     from public, anon;
-revoke all on function public.dev_return(text[],text,text,text[],text)       from public, anon;
+revoke all on function public.dev_return(text[],text,text,text[],text,text[]) from public, anon;
 grant execute on function public.is_issuer()                                   to authenticated;
 grant execute on function public.set_role(uuid,text)                           to authenticated;
 grant execute on function public.model_save(bigint,text,boolean,int,text)      to authenticated;
@@ -439,6 +454,6 @@ grant execute on function public.stock_adjust(bigint,text,int,text,text)       t
 grant execute on function public.req_create(text,text,text,text,text,jsonb)    to authenticated;
 grant execute on function public.req_cancel(text,text)                         to authenticated;
 grant execute on function public.req_fulfill(text,text,jsonb)                  to authenticated;
-grant execute on function public.dev_return(text[],text,text,text[],text)    to authenticated;
+grant execute on function public.dev_return(text[],text,text,text[],text,text[]) to authenticated;
 
 notify pgrst, 'reload schema';

@@ -194,3 +194,11 @@ td.txt{font-family:var(--f);font-size:14px}
 .misslist div{padding:3px 0}
 button.rchip{padding:5px 12px;font-size:13.5px;border-radius:99px;border-color:var(--line)}
 .missbox{background:#fff8dc;border:1px dashed var(--yel-d);border-radius:6px;padding:10px 12px;margin-bottom:8px;font-size:14px}
+/* v2.2: ขาย */
+.mrow{display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px dashed var(--yel-d)}
+.mrow:first-child{border-top:0}
+.mrow small{font-size:12.5px}
+.mrow.sold b{color:var(--blu)}
+button.soldbtn{padding:6px 14px;font-size:14px;border-color:var(--blu);color:var(--blu);flex:none}
+button.soldbtn.on{background:var(--blu);color:#fff}
+.missbox.sold{background:#e8f0fa;border-color:var(--blu)}
