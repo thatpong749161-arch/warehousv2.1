@@ -202,3 +202,8 @@ button.rchip{padding:5px 12px;font-size:13.5px;border-radius:99px;border-color:v
 button.soldbtn{padding:6px 14px;font-size:14px;border-color:var(--blu);color:var(--blu);flex:none}
 button.soldbtn.on{background:var(--blu);color:#fff}
 .missbox.sold{background:#e8f0fa;border-color:var(--blu)}
+/* v2.3 */
+body.busy .cta button.primary,body.busy dialog button.primary{opacity:.6;cursor:progress}
+dialog #toast{position:fixed;width:max-content;max-width:min(90vw,460px)}
+.danger-zone{border-color:#e8b4ab}
+.danger-zone h2::before{background:var(--red)}

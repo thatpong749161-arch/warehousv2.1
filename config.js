@@ -3,5 +3,6 @@
 window.APP_CONFIG = {
   SUPABASE_URL: 'YOUR_SUPABASE_URL',
   SUPABASE_ANON_KEY: 'YOUR_SUPABASE_ANON_KEY',
-  ORG_NAME: '' // (ไม่บังคับ) ชื่อบริษัท/สาขา แสดงบนหัวกระดาษตอนพิมพ์
+  ORG_NAME: '', // (ไม่บังคับ) ชื่อบริษัท/สาขา แสดงบนหัวกระดาษตอนพิมพ์
+  ALLOW_SIGNUP: '1' // '0' = ซ่อนปุ่มสมัครใช้งาน
 };

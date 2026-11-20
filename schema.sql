@@ -127,6 +127,12 @@ alter table public.loans     add column if not exists closed_reason  text  not n
 alter table public.documents add column if not exists sold           jsonb not null default '[]';
 create index if not exists loans_req_idx on public.loans(req_no);
 
+-- ข้อมูลผู้ใช้ (v2.3): เข้าระบบด้วย ID ได้ ไม่ต้องใช้อีเมลจริง
+alter table public.profiles add column if not exists username text not null default '';
+alter table public.profiles add column if not exists name     text not null default '';
+alter table public.profiles add column if not exists dept     text not null default '';
+create unique index if not exists profiles_username_uq on public.profiles(lower(username)) where username <> '';
+
 -- ───────── ผู้ใช้ / สิทธิ์ ─────────
 -- อัปเกรดจากเวอร์ชันแรก: ผู้ใช้ที่มีอยู่แล้วทั้งหมด = ผู้จ่ายเบิก (เจ้าหน้าที่คลังเดิม)
 insert into public.profiles(user_id, email, role)
@@ -137,9 +143,13 @@ on conflict (user_id) do nothing;
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  insert into profiles(user_id, email, role)
+  -- สิทธิ์ไม่รับจาก metadata (กันคนสมัครเองแล้วตั้งตัวเป็นผู้จ่ายเบิก)
+  insert into profiles(user_id, email, role, username, name, dept)
   values (new.id, coalesce(new.email, ''),
-          case when exists (select 1 from profiles where role = 'issuer') then 'requester' else 'issuer' end)
+          case when exists (select 1 from profiles where role = 'issuer') then 'requester' else 'issuer' end,
+          lower(coalesce(trim(new.raw_user_meta_data->>'username'), '')),
+          coalesce(trim(new.raw_user_meta_data->>'name'), ''),
+          coalesce(trim(new.raw_user_meta_data->>'dept'), ''))
   on conflict (user_id) do nothing;
   return new;
 end $$;
@@ -151,6 +161,14 @@ create or replace function public.is_issuer()
 returns boolean language sql stable security definer set search_path = public as $$
   select exists (select 1 from profiles where user_id = auth.uid() and role = 'issuer')
 $$;
+
+-- แก้ชื่อ/แผนกของตัวเอง
+create or replace function public.profile_update(p_name text, p_dept text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
+  update profiles set name = coalesce(trim(p_name), ''), dept = coalesce(trim(p_dept), '') where user_id = auth.uid();
+end $$;
 
 create or replace function public.set_role(p_user uuid, p_role text)
 returns void language plpgsql security definer set search_path = public as $$
@@ -391,6 +409,24 @@ begin
   return v_no;
 end $$;
 
+-- ───────── ล้างข้อมูลในระบบ (ผู้จ่ายเบิก) ─────────
+-- p_scope: 'tx'  = ล้างคำขอ/ใบจ่าย/ใบคืน/เครื่องค้าง/ประวัติสต็อก (เก็บรุ่นและยอดสต็อกคงเหลือไว้)
+--          'all' = ล้างทุกอย่างข้างบน + รุ่นและสต็อก
+-- บัญชีผู้ใช้และสิทธิ์ไม่ถูกลบ · ต้องส่งคำยืนยัน 'ล้างข้อมูล'
+create or replace function public.admin_reset(p_scope text, p_confirm text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  if coalesce(trim(p_confirm), '') <> 'ล้างข้อมูล' then raise exception 'คำยืนยันไม่ถูกต้อง — พิมพ์คำว่า ล้างข้อมูล'; end if;
+  if p_scope = 'tx' then
+    truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters restart identity;
+  elsif p_scope = 'all' then
+    truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters, models restart identity;
+  else
+    raise exception 'ขอบเขตการล้างไม่ถูกต้อง';
+  end if;
+end $$;
+
 -- ฟังก์ชันของเวอร์ชันแรก (เบิกโดยไม่ผ่านคำขอ/ไม่ตัดสต็อก) — เลิกใช้
 drop function if exists public.issue_devices(text,text,text,text,text,jsonb);
 drop function if exists public.return_devices(text[],text,text);
@@ -441,6 +477,8 @@ grant select on public.documents, public.document_items, public.loans,
 revoke all on function public.next_doc_no(text) from public, anon, authenticated;
 revoke all on function public.handle_new_user() from public, anon, authenticated;
 revoke all on function public.set_role(uuid,text)                              from public, anon;
+revoke all on function public.profile_update(text,text)                        from public, anon;
+revoke all on function public.admin_reset(text,text)                           from public, anon;
 revoke all on function public.model_save(bigint,text,boolean,int,text)         from public, anon;
 revoke all on function public.stock_adjust(bigint,text,int,text,text)          from public, anon;
 revoke all on function public.req_create(text,text,text,text,text,jsonb)       from public, anon;
@@ -449,6 +487,8 @@ revoke all on function public.req_fulfill(text,text,jsonb)                     f
 revoke all on function public.dev_return(text[],text,text,text[],text,text[]) from public, anon;
 grant execute on function public.is_issuer()                                   to authenticated;
 grant execute on function public.set_role(uuid,text)                           to authenticated;
+grant execute on function public.profile_update(text,text)                     to authenticated;
+grant execute on function public.admin_reset(text,text)                        to authenticated;
 grant execute on function public.model_save(bigint,text,boolean,int,text)      to authenticated;
 grant execute on function public.stock_adjust(bigint,text,int,text,text)       to authenticated;
 grant execute on function public.req_create(text,text,text,text,text,jsonb)    to authenticated;

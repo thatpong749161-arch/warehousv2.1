@@ -32,6 +32,7 @@ if (missing.length) console.warn('! public/ ขาดไฟล์: ' + missing.j
 const url = env.SUPABASE_URL || env.NEXT_PUBLIC_SUPABASE_URL || '';
 const key = env.SUPABASE_ANON_KEY || env.NEXT_PUBLIC_SUPABASE_ANON_KEY || env.SUPABASE_PUBLISHABLE_KEY || '';
 const org = env.ORG_NAME || ''; // (ไม่บังคับ) ชื่อบริษัท/สาขา แสดงบนหัวกระดาษตอนพิมพ์
+const signup = env.ALLOW_SIGNUP || '1'; // (ไม่บังคับ) 0 = ซ่อนปุ่มสมัครใช้งาน (ให้ผู้จ่ายเบิกเพิ่มผู้ใช้เท่านั้น)
 
 if (!url || !key) {
   const msg = 'ไม่พบ SUPABASE_URL / SUPABASE_ANON_KEY ใน Environment Variables';
@@ -39,6 +40,6 @@ if (!url || !key) {
   console.warn('! ' + msg + ' — ข้ามการสร้าง config.js (ใช้ไฟล์ public/config.js เดิม)');
   process.exit(0);
 }
-const out = `// สร้างอัตโนมัติโดย build.js — อย่าแก้ไฟล์นี้\nwindow.APP_CONFIG = ${JSON.stringify({ SUPABASE_URL: url, SUPABASE_ANON_KEY: key, ORG_NAME: org }, null, 2)};\n`;
+const out = `// สร้างอัตโนมัติโดย build.js — อย่าแก้ไฟล์นี้\nwindow.APP_CONFIG = ${JSON.stringify({ SUPABASE_URL: url, SUPABASE_ANON_KEY: key, ORG_NAME: org, ALLOW_SIGNUP: signup }, null, 2)};\n`;
 fs.writeFileSync(path.join(PUB, 'config.js'), out);
 console.log('✓ เขียน public/config.js แล้ว (' + url + ')');

@@ -14,16 +14,22 @@ const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
 const MOVE_T = { SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '2.2.0';
+const APP_VER = '2.3.0';
+// เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
+const ID_DOMAIN = 'loan.local';
+const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
+const showId = email => String(email || '').endsWith('@' + ID_DOMAIN) ? email.slice(0, -ID_DOMAIN.length - 1) : (email || '');
+const ID_RE = /^[a-z0-9._-]{3,30}$/i;
 
 /* ---------- Supabase ---------- */
 const cfg = window.APP_CONFIG || {};
 const ORG = cfg.ORG_NAME || '';
+const ALLOW_SIGNUP = !/^(0|false|no)$/i.test(String(cfg.ALLOW_SIGNUP ?? '1'));
 const configured = !!(window.supabase && /^https?:\/\//.test(cfg.SUPABASE_URL || '') && cfg.SUPABASE_ANON_KEY && !/YOUR_/.test(cfg.SUPABASE_URL + cfg.SUPABASE_ANON_KEY));
 const sb = configured ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true } }) : null;
 
 const state = {
-  view: '', session: null, role: 'requester', operator: '', busy: false, loadErr: '',
+  view: '', session: null, role: 'requester', me: { name: '', dept: '', username: '' }, authTab: 'login', operator: '', busy: false, loadErr: '',
   models: [], modelMap: new Map(), reqs: [], reqLimit: 200,
   open: [], openMap: new Map(), docs: [], docsLimit: 300,
   req: { person: '', dept: '', purpose: '', note: '', qty: {} },
@@ -66,7 +72,9 @@ const errMsg = e => {
   return m;
 };
 function toast(msg, err) {
-  const t = $('#toast'); t.textContent = msg; t.className = 'show' + (err ? ' err' : '');
+  const t = $('#toast'), host = [...document.querySelectorAll('dialog[open]')].pop() || document.body;
+  if (t.parentNode !== host) host.appendChild(t); // ถ้ามีหน้าต่างเปิดอยู่ ต้องอยู่ในหน้าต่าง ไม่งั้นจะถูกบัง
+  t.textContent = msg; t.className = 'show' + (err ? ' err' : '');
   clearTimeout(toast.t); toast.t = setTimeout(() => t.className = '', 2800);
 }
 let ac;
@@ -89,7 +97,7 @@ function download(name, text, mime) {
   a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 const csvCell = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-const opName = () => state.operator.trim() || state.session?.user?.email || '';
+const opName = () => state.operator.trim() || state.me.name || state.me.username || showId(state.session?.user?.email);
 const daysSince = d => Math.max(0, Math.floor((Date.now() - new Date(d)) / 864e5));
 const reqQty = r => r.request_items.reduce((a, i) => a + i.qty, 0);
 const reqIssued = r => r.request_items.reduce((a, i) => a + (i.issued || 0), 0);
@@ -121,9 +129,10 @@ async function fetchAll(build) {
   return out;
 }
 async function loadRole() {
-  const { data, error } = await sb.from('profiles').select('role').eq('user_id', state.session.user.id).maybeSingle();
+  const { data, error } = await sb.from('profiles').select('role,name,dept,username').eq('user_id', state.session.user.id).maybeSingle();
   if (error) throw error;
   state.role = data?.role === 'issuer' ? 'issuer' : 'requester';
+  state.me = { name: data?.name || '', dept: data?.dept || '', username: data?.username || showId(state.session.user.email) };
 }
 async function loadModels() {
   const { data, error } = await sb.from('models').select('*').order('name');
@@ -156,9 +165,12 @@ async function refresh() {
   fixView();
 }
 async function guarded(fn) {
-  if (state.busy) return; state.busy = true;
-  try { await fn(); } catch (e) { toast(errMsg(e), true); }
-  state.busy = false;
+  if (state.busy) return toast('กำลังบันทึก/โหลดข้อมูล รอสักครู่...');
+  state.busy = true; document.body.classList.add('busy');
+  let timer;
+  const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('เซิร์ฟเวอร์ตอบช้าเกินไป — ตรวจสอบอินเทอร์เน็ตแล้วลองใหม่ (กดรีเฟรชเพื่อดูว่าบันทึกแล้วหรือยัง)')), 30000); });
+  try { await Promise.race([fn(), timeout]); } catch (e) { toast(errMsg(e), true); }
+  finally { clearTimeout(timer); state.busy = false; document.body.classList.remove('busy'); }
 }
 async function rpc(name, args) {
   const { data, error } = await sb.rpc(name, args);
@@ -286,6 +298,16 @@ function retSumHtml() {
   const t = retLoans().length, n = state.cart.return.length;
   return t ? `<span>${esc(state.retPerson)}</span><b>${n} / ${t} เครื่อง</b>` : '<span>ยังไม่ได้เลือกผู้เบิก</span><b>0 เครื่อง</b>';
 }
+function refreshReturnInPlace() {
+  const sel = $('[data-bind=retPerson]');
+  if (!sel) return render();
+  const by = new Map(); state.open.forEach(l => by.set(l.person, (by.get(l.person) || 0) + 1));
+  if (state.retPerson && !by.has(state.retPerson)) { state.retPerson = ''; state.cart.return = []; }
+  state.cart.return = state.cart.return.filter(x => state.openMap.has(x.imei));
+  sel.innerHTML = '<option value="">— เลือกผู้เบิก (หรือยิง IMEI เลย) —</option>' + [...by.keys()].sort((a, b) => a.localeCompare(b, 'th'))
+    .map(x => `<option value="${esc(x)}" ${x === state.retPerson ? 'selected' : ''}>${esc(x)} (${by.get(x)} เครื่อง)</option>`).join('');
+  renderRet();
+}
 function renderRet() {
   const a = $('#retList'); if (a) a.innerHTML = retListHtml();
   const b = $('#retSum'); if (b) b.innerHTML = retSumHtml();
@@ -293,15 +315,37 @@ function renderRet() {
 
 /* ---------- views ---------- */
 function viewLogin() {
-  return `<section class="card" style="margin-top:20px"><h2>เข้าสู่ระบบ</h2>
-    <form id="loginForm">
-      <label>อีเมล<input name="email" type="email" autocomplete="username" required></label>
+  const su = ALLOW_SIGNUP && state.authTab === 'signup';
+  return `<section class="card" style="margin-top:20px">
+    ${ALLOW_SIGNUP ? `<div class="seg"><button data-act="authTab" data-t="login" class="${su ? '' : 'on'}">เข้าสู่ระบบ</button><button data-act="authTab" data-t="signup" class="${su ? 'on' : ''}">สมัครใช้งาน</button></div>` : '<h2>เข้าสู่ระบบ</h2>'}
+    ${su ? `<form id="signupForm">
+      <label>ID ผู้ใช้ * <small style="display:inline">(อังกฤษ/ตัวเลข 3–30 ตัว ใช้ตอนเข้าระบบ)</small><input name="uid" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+      <label>ชื่อ-นามสกุล * <small style="display:inline">(ใช้เป็นชื่อผู้เบิก)</small><input name="name" required></label>
+      <label>แผนก / งาน<input name="dept"></label>
+      <label>รหัสผ่าน * <small style="display:inline">(อย่างน้อย 6 ตัว)</small><input name="password" type="password" autocomplete="new-password" minlength="6" required></label>
+      <label>ยืนยันรหัสผ่าน *<input name="password2" type="password" autocomplete="new-password" minlength="6" required></label>
+      <button class="primary big" style="margin-top:4px">สมัครและเข้าใช้งาน</button>
+    </form>
+    <small style="margin-top:12px">สมัครแล้วเป็น “ผู้เบิก” · ผู้จ่ายเบิกเปลี่ยนสิทธิ์ให้ได้ในหน้าตั้งค่า</small>`
+    : `<form id="loginForm">
+      <label>ID ผู้ใช้ (หรืออีเมล)<input name="uid" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
       <label>รหัสผ่าน<input name="password" type="password" autocomplete="current-password" required></label>
       <button class="primary big" style="margin-top:4px">เข้าสู่ระบบ</button>
     </form>
-    <small style="margin-top:12px">บัญชีผู้ใช้สร้างโดยผู้ดูแลระบบใน Supabase (Authentication → Users)</small></section>
+    ${ALLOW_SIGNUP ? '<small style="margin-top:12px">ยังไม่มีบัญชี? กด “สมัครใช้งาน” ด้านบน</small>' : '<small style="margin-top:12px">ขอบัญชีได้จากผู้จ่ายเบิก</small>'}`}</section>
     <p class="muted center" style="font-size:12.5px">เวอร์ชัน ${APP_VER}</p>`;
 }
+const authErr = e => {
+  const m = e?.message || String(e);
+  if (/invalid login/i.test(m)) return 'ID หรือรหัสผ่านไม่ถูกต้อง';
+  if (/already registered|already exists|duplicate/i.test(m)) return 'ID นี้มีคนใช้แล้ว — ลองชื่ออื่น';
+  if (/signups? not allowed|signup is disabled/i.test(m)) return 'ระบบปิดการสมัครอยู่ — ผู้ดูแลต้องเปิด “Allow new users to sign up” ใน Supabase';
+  if (/email not confirmed/i.test(m)) return 'บัญชียังไม่ยืนยัน — ผู้ดูแลต้องปิด “Confirm email” ใน Supabase';
+  if (/password should be|weak password/i.test(m)) return 'รหัสผ่านสั้นหรือง่ายเกินไป (อย่างน้อย 6 ตัว)';
+  if (/email address .* is invalid|invalid email/i.test(m)) return 'ID นี้ใช้ไม่ได้ — ใช้ตัวอังกฤษ/ตัวเลขเท่านั้น';
+  if (/database error saving new user/i.test(m)) return 'บันทึกผู้ใช้ไม่สำเร็จ (ID อาจซ้ำ) — ลองชื่ออื่น';
+  return errMsg(e);
+};
 const viewSetup = () => `<section class="card" style="margin-top:20px"><h2>ยังไม่ได้ตั้งค่า Supabase</h2>
   <p class="muted">ไม่พบ <code>SUPABASE_URL</code> / <code>SUPABASE_ANON_KEY</code> (หรือโหลดไลบรารีไม่สำเร็จ)<br>
   บน Vercel: Settings → Environment Variables แล้ว Redeploy<br>ในเครื่อง: แก้ไฟล์ <code>public/config.js</code></p></section>`;
@@ -335,7 +379,7 @@ function setQty(id, n, syncInput = true) {
 }
 function viewRequest() {
   const r = state.req;
-  if (!r.person && !isIssuer() && state.operator) r.person = state.operator;
+  if (!isIssuer()) { if (!r.person) r.person = state.me.name || state.operator; if (!r.dept) r.dept = state.me.dept; }
   return errBanner() + (isIssuer() ? `<button class="ghost" data-view="requests" style="margin-bottom:8px">← กลับไปหน้าคำขอ</button>` : '')
   + `<section class="card"><h2>ข้อมูลผู้เบิก</h2>
     <label>ผู้เบิก *<input data-bind="req.person" value="${esc(r.person)}" list="people" autocomplete="off"></label>
@@ -516,15 +560,28 @@ function viewHistory() {
 
 function viewSettings() {
   return errBanner() + `<section class="card"><h2>ผู้ใช้งาน</h2>
-    <p class="muted" style="margin-bottom:8px">เข้าสู่ระบบเป็น <b>${esc(state.session?.user?.email || '-')}</b> · สิทธิ์ <span class="badge ${isIssuer() ? 'warn' : ''}">${ROLE_T[state.role]}</span></p>
-    <label>ชื่อผู้บันทึก (ใส่ในทุกเอกสาร — ถ้าเว้นว่างจะใช้อีเมล)<input data-bind="operator" value="${esc(state.operator)}"></label>
+    <p class="muted" style="margin-bottom:8px">ID <b class="code">${esc(state.me.username || showId(state.session?.user?.email) || '-')}</b> · สิทธิ์ <span class="badge ${isIssuer() ? 'warn' : ''}">${ROLE_T[state.role]}</span></p>
+    <div class="row" style="margin:0"><label style="margin:0">ชื่อ-นามสกุล<input id="meName" value="${esc(state.me.name)}"></label><label style="margin:0">แผนก / งาน<input id="meDept" value="${esc(state.me.dept)}"></label></div>
+    <button data-act="saveMe" style="width:100%;margin:10px 0">บันทึกชื่อ/แผนก</button>
+    ${isIssuer() ? `<label>ชื่อผู้บันทึกบนเอกสาร (ถ้าเว้นว่างใช้ชื่อด้านบน)<input data-bind="operator" value="${esc(state.operator)}"></label>` : ''}
     <button class="danger" data-act="logout" style="width:100%">ออกจากระบบ</button></section>
-  ${isIssuer() ? `<section class="card"><h2>สิทธิ์ผู้ใช้</h2>
-    <small style="margin-bottom:8px">ผู้ใช้ใหม่เป็น “ผู้เบิก” อัตโนมัติ · สร้างบัญชีได้ใน Supabase (Authentication → Users)</small>
+  ${isIssuer() ? `<section class="card"><h2>เพิ่มผู้ใช้</h2>
+    <div class="row" style="margin:0"><label style="margin:0">ID ผู้ใช้<input id="nuId" autocapitalize="none" spellcheck="false" placeholder="เช่น somchai"></label><label style="margin:0">ชื่อ-นามสกุล<input id="nuName"></label></div>
+    <div class="row" style="margin:8px 0 0"><label style="margin:0">รหัสผ่าน (≥ 6 ตัว)<input id="nuPw" type="text" autocomplete="off"></label><label style="margin:0">สิทธิ์<select id="nuRole">${Object.entries(ROLE_T).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></label></div>
+    <button class="primary big" data-act="addUser">＋ เพิ่มผู้ใช้</button></section>
+  <section class="card"><h2>สิทธิ์ผู้ใช้</h2>
+    <small style="margin-bottom:8px">ผู้ใช้ที่สมัครเองเป็น “ผู้เบิก” อัตโนมัติ</small>
     <div id="users"><p class="muted">กำลังโหลด...</p></div></section>
   <section class="card"><h2>ข้อมูล</h2>
     <p class="muted">ข้อมูลเก็บบน Supabase ใช้ร่วมกันทุกเครื่อง/ทุกคน (ต้องออนไลน์)</p>
     <div class="row"><button data-act="reload">🔄 โหลดข้อมูลใหม่</button><button data-act="exportCsv">⬇️ ส่งออก CSV</button></div></section>` : ''}
+  <section class="card danger-zone"><h2>ล้างข้อมูล</h2>
+    <button data-act="clearLocal" style="width:100%">🧹 ล้างข้อมูลในเครื่องนี้</button>
+    <small style="margin:4px 0 ${isIssuer() ? '12px' : '0'}">ลบร่างที่ยังไม่ยืนยันและแคชของแอปในเครื่องนี้ แล้วโหลดแอปใหม่ (ข้อมูลในระบบไม่หาย) — ใช้เมื่อแอปค้างหรือไม่อัปเดต</small>
+    ${isIssuer() ? `<button class="danger" data-act="resetDlg" data-scope="tx" style="width:100%">ล้างประวัติทั้งหมดในระบบ</button>
+    <small style="margin:4px 0 12px">ลบคำขอ ใบจ่าย ใบคืน รายการเครื่องค้าง และประวัติสต็อก — <b>เก็บรุ่นและยอดสต็อกไว้</b></small>
+    <button class="danger" data-act="resetDlg" data-scope="all" style="width:100%">ล้างทั้งหมด รวมรุ่นและสต็อก</button>
+    <small style="margin-top:4px">เริ่มใหม่หมด (บัญชีผู้ใช้และสิทธิ์ยังอยู่)</small>` : ''}</section>
   <section class="card"><h2>วิธีใช้</h2><p class="muted">${isIssuer()
     ? '1) เมนู “สต็อก” เพิ่มรุ่น และใส่จำนวนที่มี (รับเข้า/ตรวจนับ)<br>2) เมนู “คำขอ” เปิดคำขอที่รอจ่าย → กด “จ่าย” → สแกน IMEI ทีละเครื่อง → ยืนยัน (สต็อกลดอัตโนมัติ)<br>3) เมนู “รับคืน” สแกนเครื่องที่คืน (สต็อกเพิ่มอัตโนมัติ)<br>4) พิมพ์ใบขอเบิก/ใบจ่าย/ใบคืนได้จากหน้ารายละเอียด'
     : '1) เมนู “ขอเบิก” กรอกชื่อ → เลือกรุ่นและจำนวน → ส่งคำขอ<br>2) เมนู “คำขอของฉัน” ติดตามสถานะ เมื่อจ่ายแล้วจะเห็นเลข IMEI ของเครื่องที่ได้รับ'}
@@ -533,10 +590,10 @@ function viewSettings() {
 }
 async function loadUsersInto() {
   const box = $('#users'); if (!box) return;
-  const { data, error } = await sb.from('profiles').select('user_id,email,role').order('email');
+  const { data, error } = await sb.from('profiles').select('user_id,email,role,username,name').order('created_at');
   if (error) { box.innerHTML = `<p class="badge err">${esc(errMsg(error))}</p>`; return; }
   const me = state.session.user.id;
-  box.innerHTML = data.map(u => `<div class="line"><div class="grow"><b>${esc(u.email || u.user_id)}</b>${u.user_id === me ? '<small>คุณ</small>' : ''}</div>
+  box.innerHTML = data.map(u => `<div class="line"><div class="grow"><b>${esc(u.name || u.username || showId(u.email) || '-')}</b><small><span class="code">${esc(u.username || showId(u.email))}</span>${u.user_id === me ? ' · คุณ' : ''}</small></div>
     <select data-role-user="${u.user_id}" style="width:auto;margin:0" ${u.user_id === me ? 'disabled' : ''}>${Object.entries(ROLE_T).map(([k, v]) => `<option value="${k}" ${u.role === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>`).join('');
 }
 
@@ -548,6 +605,7 @@ function render() {
   $('#app').innerHTML = !configured ? viewSetup() : !state.session ? viewLogin() : views[state.view]();
   window.scrollTo(0, 0);
   if (state.session && state.view === 'settings' && isIssuer()) loadUsersInto();
+  if (/^(return|fulfill)$/.test(state.view) && matchMedia('(pointer:fine)').matches) $('.wedge')?.focus({ preventScroll: true });
 }
 function go(v) {
   if (!state.session || !allowed(v)) return;
@@ -557,6 +615,7 @@ function go(v) {
     if (state.view !== v) return;
     if (v === 'request') { const a = $('#modelPick'); if (a) a.innerHTML = modelPickHtml(); const p = $('#people'); if (p) p.innerHTML = peopleOpts(); const s = $('#reqSum'); if (s) s.innerHTML = reqSumHtml(); renderNav(); }
     else if (v === 'fulfill' && curReq()?.status === 'PENDING') { renderFul(); renderNav(); }
+    else if (v === 'return') { refreshReturnInPlace(); renderNav(); }
     else render();
   });
 }
@@ -627,7 +686,7 @@ const doReturn = (missing, reason, sold) => guarded(async () => {
 
 /* ---------- dialogs ---------- */
 const dlg = () => $('#dlg');
-function showDialog(html) { dlg().innerHTML = html; if (!dlg().open) dlg().showModal(); }
+function showDialog(html) { const t = $('#toast'); if (t && dlg().contains(t)) document.body.appendChild(t); dlg().innerHTML = html; if (!dlg().open) dlg().showModal(); }
 function showReq(no) {
   const r = state.reqs.find(x => x.req_no === no); if (!r) return;
   const iss = r.status === 'ISSUED', mine = r.created_by === state.session?.user?.id, no_ = esc(r.req_no);
@@ -778,21 +837,17 @@ tr.grp td span{color:var(--mut);font-weight:500}
 .meta.c4{grid-template-columns:repeat(4,1fr)}
 /* โหมดกะทัดรัด (มากกว่า 20 เครื่อง): 2 คอลัมน์ ~60 เครื่องต่อหน้า */
 .cp .hd{padding-bottom:10px}.cp .mark{width:40px;height:40px;border-radius:11px}.cp .mark svg{width:23px;height:23px}.cp h1{font-size:21px}
-.cp .meta{margin:10px 0}.cp .meta>div{padding:5px 11px 6px}.cp .val{font-size:12px}
-.cp .sumrow{margin:0 0 8px;gap:5px}.cp .pill{font-size:11px;padding:1px 3px 1px 10px}.cp .pill b{line-height:17px}
-.cgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
-.cgrid.pb{break-before:page;page-break-before:always}
-.cont{grid-column:1/-1;font-size:10.5px;font-weight:600;color:var(--mut);display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:2px}
-table.ct{table-layout:fixed}
-.ct th{padding:4px 6px;font-size:9.5px}
-.ct td{padding:1.5px 6px;font-size:10.5px;line-height:1.3;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ct tr:nth-child(even) td{background:#f6f8f9}
-.ct td.n{font-size:9.5px;width:auto}
-.ct td.imei{font-size:11px;letter-spacing:.03em}
-.ct .c{text-align:center}
-.ct i.box{display:inline-block;width:10px;height:10px;border:1.2px solid #6b7782;border-radius:2px;vertical-align:-1px}
-.cp .total{margin-top:8px}.cp .total b{font-size:17px}
-.cp .sign{margin-top:16px}.cp .sign>div{padding:9px 14px 8px}.cp .sign .ln{height:30px}
+.cp .meta{margin:8px 0 4px}.cp .meta>div{padding:4px 11px 5px}.cp .val{font-size:12px}
+.grp2{margin-top:5px;break-inside:auto}
+.grp2 .gh{display:flex;justify-content:space-between;align-items:center;background:var(--ink);color:#fff;border-radius:5px;padding:1px 10px;font-size:10.5px;line-height:1.55;break-after:avoid}
+.grp2 .gh span{background:var(--yel);color:var(--ink);font-weight:700;border-radius:99px;padding:0 8px;font-size:10.5px}
+.ig{display:grid;grid-template-columns:repeat(4,1fr);column-gap:10px;margin-top:2px}
+.ic{display:flex;align-items:center;gap:5px;padding:1.5px 2px;border-bottom:1px solid var(--line);font-size:10.5px;line-height:1.3;white-space:nowrap;break-inside:avoid}
+.ic .n{font:500 9px "IBM Plex Mono",monospace;color:var(--mut);min-width:15px}
+.ic .imei{font-size:10.8px;letter-spacing:.02em;font-weight:500}
+.ic i.box{display:inline-block;width:9px;height:9px;border:1.2px solid #59646e;border-radius:2px;flex:none}
+.cp .total{margin-top:5px}.cp .total b{font-size:17px}
+.cp .sign{margin-top:10px}.cp .sign>div{padding:8px 14px 7px}.cp .sign .ln{height:28px}
 .miss{margin-top:14px;border:1px solid #f2d16b;background:#fffaeb;border-radius:10px;padding:9px 14px;break-inside:avoid}
 .miss .mh{font-weight:700;font-size:12px}.miss .mh span{font-weight:500;color:var(--mut);margin-left:6px}
 .miss .mi{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:4px;font-size:11px}
@@ -859,14 +914,11 @@ async function printDoc(no, mode = 'table') {
       </tbody></table>
       <div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง</span></div>${sold}${miss}${sign}</section>`;
     } else {
-      // หน้าแรก 2×30 = 60 เครื่อง, หน้าถัดไป 2×46 = 92 เครื่อง
-      const rows = items.map((it, i) => ({ ...it, k: i + 1 })), pages = [];
-      for (let i = 0, cap = 60; i < rows.length; i += cap, cap = 92) pages.push(rows.slice(i, i + cap));
-      const ct = rs => `<table class="ct"><colgroup><col style="width:8%"><col style="width:41%"><col><col style="width:7%"></colgroup>
-        <thead><tr><th>#</th><th>IMEI / ซีเรียล</th><th>รุ่นเครื่อง</th><th class="c">✓</th></tr></thead><tbody>
-        ${rs.map(r => `<tr><td class="n">${String(r.k).padStart(2, '0')}</td><td class="imei">${esc(imeiFmt(r.imei))}</td><td title="${esc(r.model)}">${esc(r.model || '-')}</td><td class="c"><i class="box"></i></td></tr>`).join('')}</tbody></table>`;
-      body = `<section class="cp">${head}${metaGrid(metaCells, 4)}${pills}
-        ${pages.map((pg, pi) => { const h = Math.ceil(pg.length / 2); return `<div class="cgrid ${pi ? 'pb' : ''}">${pi ? `<div class="cont"><span>${title} · ${esc(d.doc_no)} (ต่อ)</span><span>${esc(d.person)}</span></div>` : ''}${ct(pg.slice(0, h))}${pg.length > h ? ct(pg.slice(h)) : '<div></div>'}</div>`; }).join('')}
+      // แบบกะทัดรัด: จัดกลุ่มตามรุ่น · IMEI เรียง 4 คอลัมน์ (≈ 70–90 เครื่องจบใน A4 ใบเดียว)
+      let k = 0;
+      body = `<section class="cp">${head}${metaGrid(metaCells, 4)}
+        ${[...groups].map(([m, a]) => `<div class="grp2"><div class="gh"><b>${esc(m)}</b><span>${a.length} เครื่อง</span></div>
+          <div class="ig">${a.map(it => `<div class="ic"><i class="box"></i><span class="n">${String(++k).padStart(2, '0')}</span><span class="imei">${esc(imeiFmt(it.imei))}</span></div>`).join('')}</div></div>`).join('')}
         <div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง · ${groups.size} รุ่น</span></div>${sold}${miss}${sign}</section>`;
     }
   }
@@ -923,6 +975,47 @@ const actions = {
   }),
   stockDlg: d => stockDlg(d.id),
   personDlg: d => personDlg(d.p),
+  authTab: d => { state.authTab = d.t; render(); },
+  saveMe: () => guarded(async () => {
+    await rpc('profile_update', { p_name: $('#meName').value, p_dept: $('#meDept').value });
+    await loadRole(); toast('บันทึกแล้ว');
+  }),
+  addUser: () => guarded(async () => {
+    const id = $('#nuId').value.trim(), name = $('#nuName').value.trim(), pw = $('#nuPw').value, role = $('#nuRole').value;
+    if (!ID_RE.test(id)) return toast('ID ต้องเป็นตัวอังกฤษ/ตัวเลข 3–30 ตัว', true);
+    if (!name) return toast('กรุณาใส่ชื่อ', true);
+    if (pw.length < 6) return toast('รหัสผ่านอย่างน้อย 6 ตัว', true);
+    // ใช้ client แยก (ไม่เก็บ session) เพื่อไม่ให้ผู้จ่ายเบิกหลุดออกจากระบบ
+    const tmp = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false, storageKey: 'tmp-signup' } });
+    const { data, error } = await tmp.auth.signUp({ email: toEmail(id), password: pw, options: { data: { username: id.toLowerCase(), name } } });
+    if (error) return toast(authErr(error), true);
+    if (role === 'issuer' && data.user) await rpc('set_role', { p_user: data.user.id, p_role: 'issuer' });
+    ['#nuId', '#nuName', '#nuPw'].forEach(x => $(x).value = '');
+    toast(`เพิ่มผู้ใช้ ${id} แล้ว`); loadUsersInto();
+  }),
+  clearLocal: async () => {
+    if (!confirm('ล้างร่างที่ยังไม่ยืนยันและแคชของแอปในเครื่องนี้?\n(ข้อมูลในระบบไม่หาย ไม่ต้องเข้าสู่ระบบใหม่)')) return;
+    try { localStorage.removeItem(DRAFT_KEY); localStorage.removeItem('draft-v1'); } catch { }
+    try { for (const k of await caches.keys()) await caches.delete(k); } catch { }
+    try { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); } catch { }
+    location.reload();
+  },
+  resetDlg: d => {
+    const all = d.scope === 'all';
+    showDialog(`<h2 style="color:var(--red)">⚠ ${all ? 'ล้างทั้งหมด รวมรุ่นและสต็อก' : 'ล้างประวัติทั้งหมดในระบบ'}</h2>
+      <p>จะลบ <b>คำขอ ใบจ่าย ใบคืน รายการเครื่องค้าง ประวัติสต็อก</b>${all ? ' <b>และรุ่นเครื่องทั้งหมดพร้อมยอดสต็อก</b>' : ' (รุ่นและยอดสต็อกคงเหลือยังอยู่)'} ของทุกคน <b>กู้คืนไม่ได้</b></p>
+      <button data-act="exportCsv" style="width:100%;margin-bottom:12px">⬇️ ส่งออก CSV เก็บไว้ก่อน</button>
+      <label>พิมพ์คำว่า <b>ล้างข้อมูล</b> เพื่อยืนยัน<input id="resetConfirm" autocomplete="off"></label>
+      <button class="danger big" data-act="doReset" data-scope="${all ? 'all' : 'tx'}" style="margin-top:0;background:var(--red);color:#fff">ยืนยันล้างข้อมูล</button>
+      <button class="big" data-act="closeDlg">ยกเลิก</button>`);
+  },
+  doReset: d => guarded(async () => {
+    const c = ($('#resetConfirm')?.value || '').trim();
+    if (c !== 'ล้างข้อมูล') { const i = $('#resetConfirm'); i.setCustomValidity('พิมพ์คำว่า ล้างข้อมูล'); i.reportValidity(); i.oninput = () => i.setCustomValidity(''); return; }
+    await rpc('admin_reset', { p_scope: d.scope, p_confirm: c });
+    state.cart.return = []; state.ful = null; state.req.qty = {}; saveDraft();
+    dlg().close(); await refresh(); render(); toast('ล้างข้อมูลแล้ว');
+  }),
   modelDlg: d => modelDlg(d.id),
   adjust: d => guarded(async () => {
     const raw = $('#adjQty')?.value ?? '', q = Math.floor(+raw);
@@ -943,7 +1036,7 @@ const actions = {
   logout: async () => {
     if (!confirm('ออกจากระบบ?')) return;
     await sb.auth.signOut();
-    Object.assign(state, { session: null, role: 'requester', view: '', open: [], openMap: new Map(), docs: [], reqs: [], models: [], modelMap: new Map() });
+    Object.assign(state, { session: null, role: 'requester', me: { name: '', dept: '', username: '' }, view: '', open: [], openMap: new Map(), docs: [], reqs: [], models: [], modelMap: new Map() });
     render();
   },
   exportCsv: () => guarded(async () => {
@@ -987,21 +1080,46 @@ function onBind(e) {
 }
 document.addEventListener('input', onBind);
 document.addEventListener('change', onBind);
+let scanBuf = '', scanT = 0;
 document.addEventListener('keydown', e => {
-  if (e.key !== 'Enter' || !e.target.classList?.contains('wedge')) return;
+  const scanView = state.view === 'return' ? 'return' : state.view === 'fulfill' ? 'ful' : '';
+  const t = e.target, typing = /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '') || t.isContentEditable;
+  if (scanView && !typing && !document.querySelector('dialog[open]') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const now = Date.now(); if (now - scanT > 400) scanBuf = ''; scanT = now;
+    if (e.key === 'Enter') {
+      if (scanBuf.length >= 5) { e.preventDefault(); const r = addImei(scanView, scanBuf); beep(!r.startsWith('✗')); toast(r, r.startsWith('✗')); }
+      scanBuf = ''; return;
+    }
+    if (e.key.length === 1 && /[0-9A-Za-z-]/.test(e.key)) scanBuf += e.key;
+    return;
+  }
+  if (e.key !== 'Enter' || !t.classList?.contains('wedge')) return;
   e.preventDefault();
   const code = e.target.value.trim(); e.target.value = ''; if (!code) return;
   const r = addImei(e.target.dataset.k, code);
   beep(!r.startsWith('✗')); toast(r, r.startsWith('✗'));
 });
 document.addEventListener('submit', e => {
-  if (e.target.id !== 'loginForm') return;
+  const id = e.target.getAttribute('id'); // ไม่ใช้ e.target.id — ช่องกรอกในฟอร์มอาจบังชื่อนี้
+  if (id !== 'loginForm' && id !== 'signupForm') return;
   e.preventDefault();
-  const f = new FormData(e.target);
+  const f = new FormData(e.target), get = k => String(f.get(k) || '').trim();
   guarded(async () => {
-    const { data, error } = await sb.auth.signInWithPassword({ email: String(f.get('email')).trim(), password: String(f.get('password')) });
-    if (error) return toast(/invalid login/i.test(error.message) ? 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' : errMsg(error), true);
-    state.session = data.session; state.view = ''; await refresh(); cleanDraft(); render();
+    let res;
+    if (id === 'loginForm') {
+      res = await sb.auth.signInWithPassword({ email: toEmail(get('uid')), password: String(f.get('password')) });
+    } else {
+      const uid = get('uid'), name = get('name'), pw = String(f.get('password'));
+      if (!ID_RE.test(uid)) return toast('ID ต้องเป็นตัวอังกฤษ/ตัวเลข 3–30 ตัว', true);
+      if (!name) return toast('กรุณาใส่ชื่อ-นามสกุล', true);
+      if (pw.length < 6) return toast('รหัสผ่านอย่างน้อย 6 ตัว', true);
+      if (pw !== String(f.get('password2'))) return toast('รหัสผ่านทั้งสองช่องไม่ตรงกัน', true);
+      res = await sb.auth.signUp({ email: toEmail(uid), password: pw, options: { data: { username: uid.toLowerCase(), name, dept: get('dept') } } });
+      if (!res.error && !res.data.session) return toast('สมัครแล้ว แต่ยังเข้าใช้ไม่ได้ — ผู้ดูแลต้องปิด “Confirm email” ใน Supabase', true);
+    }
+    if (res.error) return toast(authErr(res.error), true);
+    state.session = res.data.session; state.view = ''; await refresh(); cleanDraft(); render();
+    if (id === 'signupForm') toast('สมัครเรียบร้อย ยินดีต้อนรับ');
   });
 });
 const setNet = () => { const n = $('#net'); n.textContent = navigator.onLine ? 'ออนไลน์' : 'ออฟไลน์'; n.className = 'badge ' + (navigator.onLine ? 'ok' : 'warn'); };
