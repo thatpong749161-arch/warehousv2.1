@@ -190,6 +190,134 @@ begin
   return p_prefix || '-' || d || '-' || lpad(k::text, 3, '0');
 end $$;
 
+-- ───────── บัญชีผู้ใช้แบบ ID + รหัสผ่าน (สร้างผ่านฟังก์ชันนี้ ไม่ผ่านระบบสมัครของ Supabase) ─────────
+-- ข้อดี: ไม่ติดการตรวจอีเมล/นโยบายรหัสผ่านของ Supabase · ไม่ต้องเปิด "Allow new users to sign up" / ปิด "Confirm email"
+create extension if not exists pgcrypto with schema extensions;
+
+create table if not exists public.app_settings (key text primary key, value jsonb not null);
+insert into public.app_settings(key, value) values ('allow_signup', 'true') on conflict (key) do nothing;
+
+-- ค่าที่หน้าเข้าสู่ระบบต้องรู้ (เรียกได้โดยไม่ต้องล็อกอิน)
+create or replace function public.app_config()
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('allow_signup', coalesce((select value from app_settings where key = 'allow_signup'), 'true'::jsonb))
+$$;
+
+create or replace function public.set_allow_signup(p_on boolean)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  insert into app_settings(key, value) values ('allow_signup', to_jsonb(coalesce(p_on, true)))
+  on conflict (key) do update set value = excluded.value;
+end $$;
+
+-- สมัครเอง (ไม่ต้องล็อกอิน → ผู้เบิก) หรือผู้จ่ายเบิกเพิ่มให้ (เลือกสิทธิ์ได้)
+create or replace function public.app_signup(
+  p_username text, p_password text, p_name text, p_dept text default '', p_role text default 'requester')
+returns uuid language plpgsql security definer set search_path = public, extensions as $$
+declare
+  v_u text := lower(trim(coalesce(p_username, ''))); v_email text; v_id uuid := gen_random_uuid();
+  v_issuer boolean := is_issuer(); v_role text := coalesce(p_role, 'requester');
+begin
+  if v_u !~ '^[a-z0-9._-]{3,30}$' then raise exception 'ID ต้องเป็นตัวอังกฤษพิมพ์เล็ก/ตัวเลข/จุด/ขีด 3–30 ตัว'; end if;
+  if length(coalesce(p_password, '')) < 6 then raise exception 'รหัสผ่านอย่างน้อย 6 ตัว'; end if;
+  if coalesce(trim(p_name), '') = '' then raise exception 'กรุณาใส่ชื่อ-นามสกุล'; end if;
+  if v_role not in ('requester','issuer') then raise exception 'สิทธิ์ไม่ถูกต้อง'; end if;
+  if not v_issuer then
+    if v_role <> 'requester' then raise exception 'ไม่มีสิทธิ์สร้างผู้จ่ายเบิก'; end if;
+    if coalesce((select value from app_settings where key = 'allow_signup'), 'true'::jsonb) <> 'true'::jsonb then
+      raise exception 'ระบบปิดการสมัครเองอยู่ — ขอบัญชีจากผู้จ่ายเบิก';
+    end if;
+  end if;
+  v_email := v_u || '@loan.local';
+  if exists (select 1 from auth.users where lower(email) = v_email)
+     or exists (select 1 from profiles where lower(username) = v_u) then
+    raise exception 'ID นี้มีคนใช้แล้ว — ลองชื่ออื่น';
+  end if;
+
+  insert into auth.users (instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
+                          raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+                          confirmation_token, recovery_token, email_change_token_new, email_change,
+                          email_change_token_current, phone_change, phone_change_token, reauthentication_token)
+  values ('00000000-0000-0000-0000-000000000000', v_id, 'authenticated', 'authenticated', v_email,
+          crypt(p_password, gen_salt('bf')), now(),
+          '{"provider":"email","providers":["email"]}',
+          jsonb_build_object('username', v_u, 'name', trim(p_name), 'dept', coalesce(trim(p_dept), '')),
+          now(), now(), '', '', '', '', '', '', '', '');
+  insert into auth.identities (id, provider_id, user_id, identity_data, provider, last_sign_in_at, created_at, updated_at)
+  values (gen_random_uuid(), v_id::text, v_id,
+          jsonb_build_object('sub', v_id::text, 'email', v_email, 'email_verified', true),
+          'email', now(), now(), now());
+  -- profile ถูกสร้างโดย trigger on_auth_user_created_profile แล้ว
+  if v_issuer then update profiles set role = v_role where user_id = v_id; end if;
+  return v_id;
+end $$;
+
+-- ผู้จ่ายเบิกตั้งรหัสผ่านใหม่ให้ผู้ใช้ (กรณีลืมรหัส)
+create or replace function public.admin_set_password(p_user uuid, p_password text)
+returns void language plpgsql security definer set search_path = public, extensions as $$
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  if length(coalesce(p_password, '')) < 6 then raise exception 'รหัสผ่านอย่างน้อย 6 ตัว'; end if;
+  update auth.users set encrypted_password = crypt(p_password, gen_salt('bf')), updated_at = now() where id = p_user;
+  if not found then raise exception 'ไม่พบผู้ใช้'; end if;
+end $$;
+
+-- เปลี่ยนรหัสผ่านของตัวเอง
+create or replace function public.my_set_password(p_password text)
+returns void language plpgsql security definer set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
+  if length(coalesce(p_password, '')) < 6 then raise exception 'รหัสผ่านอย่างน้อย 6 ตัว'; end if;
+  update auth.users set encrypted_password = crypt(p_password, gen_salt('bf')), updated_at = now() where id = auth.uid();
+end $$;
+
+-- ───────── ประกาศ (เครื่องเข้าใหม่ / ข่าวสาร) — ผู้จ่ายเบิกเขียน ทุกคนเห็น ─────────
+create table if not exists public.announcements (
+  id         bigint generated always as identity primary key,
+  title      text not null,
+  body       text not null default '',
+  kind       text not null default 'new' check (kind in ('new','info','urgent')),
+  eta        date,               -- วันที่คาดว่าเครื่องจะเข้า (ไม่บังคับ)
+  show_until date,               -- แสดงถึงวันที่ (ไม่ใส่ = แสดงไปเรื่อย ๆ)
+  pinned     boolean not null default false,
+  active     boolean not null default true,
+  by_name    text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create or replace function public.ann_save(
+  p_id bigint, p_title text, p_body text, p_kind text, p_eta date, p_show_until date,
+  p_pinned boolean, p_active boolean, p_by text)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare v_id bigint;
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  if coalesce(trim(p_title), '') = '' then raise exception 'กรุณาใส่หัวข้อประกาศ'; end if;
+  if coalesce(p_kind, 'new') not in ('new','info','urgent') then raise exception 'ประเภทประกาศไม่ถูกต้อง'; end if;
+  if p_id is null then
+    insert into announcements(title, body, kind, eta, show_until, pinned, active, by_name)
+    values (trim(p_title), coalesce(trim(p_body), ''), coalesce(p_kind, 'new'), p_eta, p_show_until,
+            coalesce(p_pinned, false), coalesce(p_active, true), coalesce(trim(p_by), ''))
+    returning id into v_id;
+  else
+    update announcements set title = trim(p_title), body = coalesce(trim(p_body), ''), kind = coalesce(p_kind, 'new'),
+      eta = p_eta, show_until = p_show_until, pinned = coalesce(p_pinned, false), active = coalesce(p_active, true),
+      by_name = coalesce(trim(p_by), ''), updated_at = now()
+    where id = p_id returning id into v_id;
+    if v_id is null then raise exception 'ไม่พบประกาศนี้'; end if;
+  end if;
+  return v_id;
+end $$;
+
+create or replace function public.ann_delete(p_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  delete from announcements where id = p_id;
+end $$;
+
 -- ───────── รุ่น / สต็อก (ผู้จ่ายเบิก) ─────────
 create or replace function public.model_save(p_id bigint, p_name text, p_active boolean, p_stock int, p_by text)
 returns bigint language plpgsql security definer set search_path = public as $$
@@ -441,6 +569,8 @@ alter table public.models         enable row level security;
 alter table public.stock_moves    enable row level security;
 alter table public.requests       enable row level security;
 alter table public.request_items  enable row level security;
+alter table public.app_settings   enable row level security;
+alter table public.announcements  enable row level security;
 
 drop policy if exists "read documents"      on public.documents;
 drop policy if exists "read document_items" on public.document_items;
@@ -450,11 +580,15 @@ drop policy if exists "read models"         on public.models;
 drop policy if exists "read stock_moves"    on public.stock_moves;
 drop policy if exists "read requests"       on public.requests;
 drop policy if exists "read request_items"  on public.request_items;
+drop policy if exists "read announcements"  on public.announcements;
 
 -- ผู้จ่ายเบิกเห็นทุกอย่าง · ผู้เบิกเห็นเฉพาะคำขอ/ใบจ่าย/เครื่องของคำขอตัวเอง
 create policy "read profiles" on public.profiles for select to authenticated
   using (user_id = auth.uid() or is_issuer());
 create policy "read models" on public.models for select to authenticated using (true);
+-- ผู้เบิกเห็นเฉพาะประกาศที่เปิดอยู่และยังไม่หมดเวลา · ผู้จ่ายเบิกเห็นทั้งหมด (รวมที่ซ่อนไว้)
+create policy "read announcements" on public.announcements for select to authenticated
+  using (is_issuer() or (active and (show_until is null or show_until >= (now() at time zone 'Asia/Bangkok')::date)));
 create policy "read stock_moves" on public.stock_moves for select to authenticated using (is_issuer());
 create policy "read requests" on public.requests for select to authenticated
   using (created_by = auth.uid() or is_issuer());
@@ -489,6 +623,23 @@ grant execute on function public.is_issuer()                                   t
 grant execute on function public.set_role(uuid,text)                           to authenticated;
 grant execute on function public.profile_update(text,text)                     to authenticated;
 grant execute on function public.admin_reset(text,text)                        to authenticated;
+revoke all on function public.app_config()                                     from public;
+revoke all on function public.set_allow_signup(boolean)                        from public, anon;
+revoke all on function public.app_signup(text,text,text,text,text)             from public;
+revoke all on function public.admin_set_password(uuid,text)                    from public, anon;
+revoke all on function public.my_set_password(text)                            from public, anon;
+grant execute on function public.app_config()                                  to anon, authenticated;
+grant execute on function public.app_signup(text,text,text,text,text)          to anon, authenticated;
+grant execute on function public.set_allow_signup(boolean)                     to authenticated;
+grant execute on function public.admin_set_password(uuid,text)                 to authenticated;
+grant execute on function public.my_set_password(text)                         to authenticated;
+revoke all on public.app_settings from anon, authenticated;
+revoke all on public.announcements from anon, authenticated;
+grant select on public.announcements to authenticated;
+revoke all on function public.ann_save(bigint,text,text,text,date,date,boolean,boolean,text) from public, anon;
+revoke all on function public.ann_delete(bigint)                                             from public, anon;
+grant execute on function public.ann_save(bigint,text,text,text,date,date,boolean,boolean,text) to authenticated;
+grant execute on function public.ann_delete(bigint)                                             to authenticated;
 grant execute on function public.model_save(bigint,text,boolean,int,text)      to authenticated;
 grant execute on function public.stock_adjust(bigint,text,int,text,text)       to authenticated;
 grant execute on function public.req_create(text,text,text,text,text,jsonb)    to authenticated;

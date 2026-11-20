@@ -14,7 +14,7 @@ const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
 const MOVE_T = { SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '2.3.0';
+const APP_VER = '2.4.0';
 // เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
 const ID_DOMAIN = 'loan.local';
 const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
@@ -29,12 +29,12 @@ const configured = !!(window.supabase && /^https?:\/\//.test(cfg.SUPABASE_URL ||
 const sb = configured ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true } }) : null;
 
 const state = {
-  view: '', session: null, role: 'requester', me: { name: '', dept: '', username: '' }, authTab: 'login', operator: '', busy: false, loadErr: '',
-  models: [], modelMap: new Map(), reqs: [], reqLimit: 200,
+  view: '', session: null, role: 'requester', me: { name: '', dept: '', username: '' }, authTab: 'login', signupOpen: true, operator: '', busy: false, loadErr: '',
+  models: [], modelMap: new Map(), reqs: [], reqLimit: 200, anns: [], annEdit: null,
   open: [], openMap: new Map(), docs: [], docsLimit: 300,
   req: { person: '', dept: '', purpose: '', note: '', qty: {} },
   ful: null, // { no, items: [{ imei, model_id }], cur: model_id }
-  cart: { return: [] }, rnote: '', retPerson: '', loose: false,
+  cart: { return: [] }, rnote: '', retPerson: '', retQ: '', loose: false,
   outQ: '', hq: '', ht: '', rq: 'PENDING', pq: '', mq: '', sq: '', newModel: '', newQty: ''
 };
 const isIssuer = () => state.role === 'issuer';
@@ -46,11 +46,12 @@ const IC = {
   ret: '<path d="M12 3v11M7 9l5 5 5-5M4 17v3h16v-3"/>',
   dev: '<rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M10.5 18.5h3"/>',
   box: '<path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5zM3 7.5l9 4.5 9-4.5M12 12v9"/>',
-  hist: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3zM9 8h6M9 12h6"/>'
+  hist: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3zM9 8h6M9 12h6"/>',
+  news: '<path d="M3 10.5v3h2.5L12 18V6L5.5 10.5H3zM15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/>'
 };
 const NAV = {
-  requester: [['request', 'ขอเบิก', 'req'], ['requests', 'คำขอของฉัน', 'list']],
-  issuer: [['requests', 'คำขอ', 'list'], ['return', 'รับคืน', 'ret'], ['out', 'ค้างอยู่', 'dev'], ['stock', 'สต็อก', 'box'], ['history', 'ประวัติ', 'hist']]
+  requester: [['request', 'ขอเบิก', 'req'], ['requests', 'คำขอของฉัน', 'list'], ['news', 'ประกาศ', 'news']],
+  issuer: [['requests', 'คำขอ', 'list'], ['return', 'รับคืน', 'ret'], ['out', 'ค้างอยู่', 'dev'], ['stock', 'สต็อก', 'box'], ['news', 'ประกาศ', 'news'], ['history', 'ประวัติ', 'hist']]
 };
 const EXTRA = { requester: ['settings'], issuer: ['request', 'fulfill', 'settings'] };
 const allowed = v => NAV[state.role].some(x => x[0] === v) || EXTRA[state.role].includes(v);
@@ -58,9 +59,10 @@ const fixView = () => { if (!allowed(state.view)) state.view = NAV[state.role][0
 
 function renderNav() {
   const pend = state.reqs.filter(r => r.status === 'PENDING').length;
-  const badge = { requests: pend, out: state.open.length };
+  const badge = { requests: pend, out: state.open.length, news: annUnseen() };
   const on = v => state.view === v || (v === 'requests' && state.view === 'fulfill');
   $('#nav').innerHTML = state.session ? NAV[state.role].map(([v, t, i]) => `<button data-view="${v}" class="${on(v) ? 'on' : ''}" data-n="${badge[v] || ''}"><svg viewBox="0 0 24 24">${IC[i]}</svg><span>${t}</span></button>`).join('') : '';
+  renderTicker();
   const rb = $('#role'); if (rb) { rb.hidden = !state.session; rb.textContent = ROLE_T[state.role]; rb.className = 'badge' + (isIssuer() ? ' warn' : ''); }
 }
 
@@ -128,11 +130,19 @@ async function fetchAll(build) {
   }
   return out;
 }
+async function loadAppConfig() {
+  try { const { data } = await sb.rpc('app_config'); if (data) state.signupOpen = data.allow_signup !== false; } catch { }
+}
 async function loadRole() {
   const { data, error } = await sb.from('profiles').select('role,name,dept,username').eq('user_id', state.session.user.id).maybeSingle();
   if (error) throw error;
   state.role = data?.role === 'issuer' ? 'issuer' : 'requester';
   state.me = { name: data?.name || '', dept: data?.dept || '', username: data?.username || showId(state.session.user.email) };
+}
+async function loadAnns() {
+  const { data, error } = await sb.from('announcements').select('*').order('pinned', { ascending: false }).order('created_at', { ascending: false }).limit(100);
+  if (error) throw error;
+  state.anns = data;
 }
 async function loadModels() {
   const { data, error } = await sb.from('models').select('*').order('name');
@@ -158,7 +168,7 @@ async function refresh() {
   if (!sb || !state.session) return;
   try {
     await loadRole();
-    const jobs = [loadModels(), loadReqs()];
+    const jobs = [loadModels(), loadReqs(), loadAppConfig(), loadAnns()];
     if (isIssuer()) jobs.push(loadOpen(), loadDocs()); else { state.open = []; state.openMap = new Map(); state.docs = []; }
     await Promise.all(jobs); state.loadErr = '';
   } catch (e) { state.loadErr = errMsg(e); }
@@ -247,7 +257,7 @@ function addReturn(raw) {
   if (!validImei(s)) return `✗ ${s} ไม่ใช่ IMEI ที่ถูกต้อง (15 หลัก)`;
   const loan = state.openMap.get(s);
   if (!loan) return `✗ ${s} ไม่ได้อยู่ในสถานะถูกเบิก`;
-  if (!state.retPerson) { state.retPerson = loan.person; const sel = $('[data-bind=retPerson]'); if (sel) sel.value = loan.person; }
+  if (!state.retPerson) { state.retPerson = loan.person; const w = $('#retWho'); if (w) w.innerHTML = retWhoHtml(); }
   else if (loan.person !== state.retPerson) return `✗ ${s} เป็นเครื่องของ ${loan.person} (ไม่ใช่ ${state.retPerson})`;
   if (c.some(x => x.imei === s)) return `✗ ยิง ${s} ซ้ำ`;
   c.push({ imei: s, model: loan.model, person: loan.person });
@@ -298,15 +308,15 @@ function retSumHtml() {
   const t = retLoans().length, n = state.cart.return.length;
   return t ? `<span>${esc(state.retPerson)}</span><b>${n} / ${t} เครื่อง</b>` : '<span>ยังไม่ได้เลือกผู้เบิก</span><b>0 เครื่อง</b>';
 }
+let retSig = '';
+const retSignature = () => state.open.map(l => l.imei + '|' + l.person + '|' + (l.last_note || '')).sort().join(',');
 function refreshReturnInPlace() {
-  const sel = $('[data-bind=retPerson]');
-  if (!sel) return render();
-  const by = new Map(); state.open.forEach(l => by.set(l.person, (by.get(l.person) || 0) + 1));
-  if (state.retPerson && !by.has(state.retPerson)) { state.retPerson = ''; state.cart.return = []; }
+  if (!$('#retWho')) return render();
+  const sig = retSignature(); if (sig === retSig) return; // ข้อมูลไม่เปลี่ยน → ไม่แตะหน้าจอเลย
+  retSig = sig;
+  if (state.retPerson && !retPeople().has(state.retPerson)) { state.retPerson = ''; state.cart.return = []; }
   state.cart.return = state.cart.return.filter(x => state.openMap.has(x.imei));
-  sel.innerHTML = '<option value="">— เลือกผู้เบิก (หรือยิง IMEI เลย) —</option>' + [...by.keys()].sort((a, b) => a.localeCompare(b, 'th'))
-    .map(x => `<option value="${esc(x)}" ${x === state.retPerson ? 'selected' : ''}>${esc(x)} (${by.get(x)} เครื่อง)</option>`).join('');
-  renderRet();
+  renderRetAll();
 }
 function renderRet() {
   const a = $('#retList'); if (a) a.innerHTML = retListHtml();
@@ -315,9 +325,9 @@ function renderRet() {
 
 /* ---------- views ---------- */
 function viewLogin() {
-  const su = ALLOW_SIGNUP && state.authTab === 'signup';
+  const canSignup = ALLOW_SIGNUP && state.signupOpen, su = canSignup && state.authTab === 'signup';
   return `<section class="card" style="margin-top:20px">
-    ${ALLOW_SIGNUP ? `<div class="seg"><button data-act="authTab" data-t="login" class="${su ? '' : 'on'}">เข้าสู่ระบบ</button><button data-act="authTab" data-t="signup" class="${su ? 'on' : ''}">สมัครใช้งาน</button></div>` : '<h2>เข้าสู่ระบบ</h2>'}
+    ${canSignup ? `<div class="seg"><button data-act="authTab" data-t="login" class="${su ? '' : 'on'}">เข้าสู่ระบบ</button><button data-act="authTab" data-t="signup" class="${su ? 'on' : ''}">สมัครใช้งาน</button></div>` : '<h2>เข้าสู่ระบบ</h2>'}
     ${su ? `<form id="signupForm">
       <label>ID ผู้ใช้ * <small style="display:inline">(อังกฤษ/ตัวเลข 3–30 ตัว ใช้ตอนเข้าระบบ)</small><input name="uid" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
       <label>ชื่อ-นามสกุล * <small style="display:inline">(ใช้เป็นชื่อผู้เบิก)</small><input name="name" required></label>
@@ -332,7 +342,7 @@ function viewLogin() {
       <label>รหัสผ่าน<input name="password" type="password" autocomplete="current-password" required></label>
       <button class="primary big" style="margin-top:4px">เข้าสู่ระบบ</button>
     </form>
-    ${ALLOW_SIGNUP ? '<small style="margin-top:12px">ยังไม่มีบัญชี? กด “สมัครใช้งาน” ด้านบน</small>' : '<small style="margin-top:12px">ขอบัญชีได้จากผู้จ่ายเบิก</small>'}`}</section>
+    ${canSignup ? '<small style="margin-top:12px">ยังไม่มีบัญชี? กด “สมัครใช้งาน” ด้านบน</small>' : '<small style="margin-top:12px">ขอบัญชีได้จากผู้จ่ายเบิก</small>'}`}</section>
     <p class="muted center" style="font-size:12.5px">เวอร์ชัน ${APP_VER}</p>`;
 }
 const authErr = e => {
@@ -342,7 +352,7 @@ const authErr = e => {
   if (/signups? not allowed|signup is disabled/i.test(m)) return 'ระบบปิดการสมัครอยู่ — ผู้ดูแลต้องเปิด “Allow new users to sign up” ใน Supabase';
   if (/email not confirmed/i.test(m)) return 'บัญชียังไม่ยืนยัน — ผู้ดูแลต้องปิด “Confirm email” ใน Supabase';
   if (/password should be|weak password/i.test(m)) return 'รหัสผ่านสั้นหรือง่ายเกินไป (อย่างน้อย 6 ตัว)';
-  if (/email address .* is invalid|invalid email/i.test(m)) return 'ID นี้ใช้ไม่ได้ — ใช้ตัวอังกฤษ/ตัวเลขเท่านั้น';
+  if (/email address .* is invalid|invalid email/i.test(m)) return 'Supabase ไม่รับบัญชีนี้ (' + m + ')';
   if (/database error saving new user/i.test(m)) return 'บันทึกผู้ใช้ไม่สำเร็จ (ID อาจซ้ำ) — ลองชื่ออื่น';
   return errMsg(e);
 };
@@ -354,13 +364,15 @@ const peopleList = () => [...new Set([...state.reqs.map(r => r.person), ...state
 const peopleOpts = () => peopleList().map(x => `<option value="${esc(x)}">`).join('');
 
 /* ขอเบิก: เลือกรุ่น + จำนวน */
+// ป้ายจำนวนคงเหลือ (ผู้เบิกเห็นด้วย — ขอเกินคงเหลือได้ ผู้จ่ายเบิกจะพิจารณาเอง)
+const stockTag = n => `<span class="stk-tag ${n <= 0 ? 'out' : n <= 3 ? 'low' : 'ok'}">${n <= 0 ? 'หมด' : 'คงเหลือ ' + num(n)}${n > 0 && n <= 3 ? ' · ใกล้หมด' : ''}</span>`;
 function modelPickHtml() {
   const q = state.mq.trim().toLowerCase();
   const ms = state.models.filter(m => m.active);
   if (!ms.length) return `<p class="muted center">ยังไม่มีรุ่นเครื่องให้เลือก${isIssuer() ? ' — เพิ่มรุ่นได้ที่เมนู “สต็อก”' : ' — ติดต่อผู้จ่ายเบิกให้เพิ่มรุ่น'}</p>`;
   const list = ms.filter(m => !q || m.name.toLowerCase().includes(q) || state.req.qty[m.id]);
   return list.map(m => { const n = state.req.qty[m.id] || 0; return `<div class="pick ${n ? 'on' : ''}" id="pk-${m.id}">
-    <div class="nm">${esc(m.name)}${isIssuer() ? `<small>คงเหลือ ${num(m.stock)}</small>` : ''}</div>
+    <div class="nm">${esc(m.name)}${stockTag(m.stock)}</div>
     <div class="step"><button data-act="qty" data-id="${m.id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="999" data-qty="${m.id}" value="${n || ''}" placeholder="0" aria-label="จำนวน ${esc(m.name)}"><button data-act="qty" data-id="${m.id}" data-d="1" aria-label="เพิ่ม">+</button></div></div>`; }).join('')
     || '<p class="muted center">ไม่พบรุ่นที่ค้นหา</p>';
 }
@@ -455,15 +467,37 @@ function viewFulfill() {
 }
 
 /* รับคืน: เลือกผู้เบิก → เห็น IMEI ทั้งหมด → ยิงอย่างเดียว */
+function retPeople() {
+  const by = new Map(); state.open.forEach(l => { const g = by.get(l.person) || { n: 0, oldest: l.issued_at }; g.n++; if (new Date(l.issued_at) < new Date(g.oldest)) g.oldest = l.issued_at; by.set(l.person, g); });
+  return by;
+}
+// ผู้เบิก: เลือกแล้วโชว์ชื่อ + ปุ่มเปลี่ยน · ยังไม่เลือก โชว์การ์ดรายชื่อ (ปุ่มใหญ่ แตะง่าย ไม่ใช้ dropdown)
+function retWhoHtml() {
+  const by = retPeople();
+  if (state.retPerson && by.has(state.retPerson)) return `<div class="who"><div class="grow"><small>ผู้เบิก</small><b>${esc(state.retPerson)}</b></div>
+    <button data-act="retClear">เปลี่ยนผู้เบิก</button></div>`;
+  if (!by.size) return '<p class="muted center" style="margin:0">ไม่มีเครื่องค้างอยู่</p>';
+  return `<small style="margin-bottom:8px">แตะชื่อผู้เบิก หรือยิง IMEI ได้เลย — ระบบเลือกผู้เบิกให้เอง</small>
+    ${by.size > 8 ? `<input data-bind="retQ" placeholder="ค้นหาชื่อผู้เบิก" value="${esc(state.retQ)}" autocomplete="off" style="margin:0 0 8px">` : ''}
+    <div class="plist" id="plist">${plistHtml(by)}</div>`;
+}
+function plistHtml(by = retPeople()) {
+  const q = state.retQ.trim().toLowerCase();
+  const list = [...by].filter(([p]) => !q || p.toLowerCase().includes(q)).sort((a, b) => a[0].localeCompare(b[0], 'th'));
+  return list.length ? list.map(([p, g]) => { const d = daysSince(g.oldest); return `<button class="pbtn" data-act="pickPerson" data-p="${esc(p)}">
+    <b>${esc(p)}</b><span><i>${g.n}</i> เครื่อง${d >= 7 ? ` · <em>${d} วัน</em>` : ''}</span></button>`; }).join('') : '<p class="muted center" style="margin:4px 0">ไม่พบชื่อ</p>';
+}
+function renderRetAll() {
+  const w = $('#retWho'); if (w) w.innerHTML = retWhoHtml();
+  renderRet();
+}
 function viewReturn() {
-  const by = new Map(); state.open.forEach(l => by.set(l.person, (by.get(l.person) || 0) + 1));
-  const people = [...by.keys()].sort((a, b) => a.localeCompare(b, 'th'));
+  const by = retPeople();
   if (state.retPerson && !by.has(state.retPerson)) { state.retPerson = ''; state.cart.return = []; }
+  retSig = retSignature();
   return errBanner() + `<section class="card"><h2>รับคืนเครื่อง</h2>
-    ${people.length ? `<label>ผู้เบิก<select data-bind="retPerson"><option value="">— เลือกผู้เบิก (หรือยิง IMEI เลย) —</option>
-      ${people.map(x => `<option value="${esc(x)}" ${x === state.retPerson ? 'selected' : ''}>${esc(x)} (${by.get(x)} เครื่อง)</option>`).join('')}</select></label>`
-      : '<p class="muted center" style="margin:0">ไม่มีเครื่องค้างอยู่</p>'}
-    <label style="margin-bottom:0">หมายเหตุ (เช่น สภาพเครื่อง)<input data-bind="rnote" value="${esc(state.rnote)}"></label></section>
+    <div id="retWho">${retWhoHtml()}</div>
+    <label style="margin:12px 0 0">หมายเหตุ (เช่น สภาพเครื่อง)<input data-bind="rnote" value="${esc(state.rnote)}"></label></section>
   <section class="card"><h2>ยิง IMEI ที่คืน</h2>${scanBox('return', false)}
     <div id="retList" style="margin-top:12px">${retListHtml()}</div></section>
   <div class="cta"><div class="sum" id="retSum">${retSumHtml()}</div>
@@ -564,11 +598,14 @@ function viewSettings() {
     <div class="row" style="margin:0"><label style="margin:0">ชื่อ-นามสกุล<input id="meName" value="${esc(state.me.name)}"></label><label style="margin:0">แผนก / งาน<input id="meDept" value="${esc(state.me.dept)}"></label></div>
     <button data-act="saveMe" style="width:100%;margin:10px 0">บันทึกชื่อ/แผนก</button>
     ${isIssuer() ? `<label>ชื่อผู้บันทึกบนเอกสาร (ถ้าเว้นว่างใช้ชื่อด้านบน)<input data-bind="operator" value="${esc(state.operator)}"></label>` : ''}
+    <details style="margin-bottom:10px"><summary class="muted" style="cursor:pointer">เปลี่ยนรหัสผ่าน</summary>
+      <div class="row" style="margin:6px 0 0"><input id="myPw" type="password" autocomplete="new-password" placeholder="รหัสผ่านใหม่ (≥ 6 ตัว)" style="margin:0"><button data-act="myPw" style="flex:0 0 auto">บันทึก</button></div></details>
     <button class="danger" data-act="logout" style="width:100%">ออกจากระบบ</button></section>
   ${isIssuer() ? `<section class="card"><h2>เพิ่มผู้ใช้</h2>
     <div class="row" style="margin:0"><label style="margin:0">ID ผู้ใช้<input id="nuId" autocapitalize="none" spellcheck="false" placeholder="เช่น somchai"></label><label style="margin:0">ชื่อ-นามสกุล<input id="nuName"></label></div>
     <div class="row" style="margin:8px 0 0"><label style="margin:0">รหัสผ่าน (≥ 6 ตัว)<input id="nuPw" type="text" autocomplete="off"></label><label style="margin:0">สิทธิ์<select id="nuRole">${Object.entries(ROLE_T).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></label></div>
-    <button class="primary big" data-act="addUser">＋ เพิ่มผู้ใช้</button></section>
+    <button class="primary big" data-act="addUser">＋ เพิ่มผู้ใช้</button>
+    <label class="chk" style="margin:12px 0 0"><input type="checkbox" id="allowSignup" ${state.signupOpen ? 'checked' : ''}> ให้ผู้ใช้กด “สมัครใช้งาน” เองได้ที่หน้าเข้าสู่ระบบ</label></section>
   <section class="card"><h2>สิทธิ์ผู้ใช้</h2>
     <small style="margin-bottom:8px">ผู้ใช้ที่สมัครเองเป็น “ผู้เบิก” อัตโนมัติ</small>
     <div id="users"><p class="muted">กำลังโหลด...</p></div></section>
@@ -594,10 +631,69 @@ async function loadUsersInto() {
   if (error) { box.innerHTML = `<p class="badge err">${esc(errMsg(error))}</p>`; return; }
   const me = state.session.user.id;
   box.innerHTML = data.map(u => `<div class="line"><div class="grow"><b>${esc(u.name || u.username || showId(u.email) || '-')}</b><small><span class="code">${esc(u.username || showId(u.email))}</span>${u.user_id === me ? ' · คุณ' : ''}</small></div>
+    ${u.user_id === me ? '' : `<button class="ghost" data-act="resetPw" data-u="${u.user_id}" data-n="${esc(u.username || showId(u.email))}" title="ตั้งรหัสผ่านใหม่" style="padding:6px">🔑</button>`}
     <select data-role-user="${u.user_id}" style="width:auto;margin:0" ${u.user_id === me ? 'disabled' : ''}>${Object.entries(ROLE_T).map(([k, v]) => `<option value="${k}" ${u.role === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>`).join('');
 }
 
-const views = { request: viewRequest, requests: viewRequests, fulfill: viewFulfill, return: viewReturn, out: viewOut, stock: viewStock, history: viewHistory, settings: viewSettings };
+/* ---------- ประกาศ ---------- */
+const ANN_K = { new: ['🆕', 'เครื่องเข้าใหม่'], info: ['📢', 'ข่าวสาร'], urgent: ['⚠️', 'ด่วน'] };
+const todayISO = () => new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD ตามเวลาเครื่อง
+const annVisible = a => a.active && (!a.show_until || a.show_until >= todayISO());
+const annShown = () => state.anns.filter(annVisible);
+function etaText(eta) {
+  if (!eta) return '';
+  const d = Math.round((new Date(eta + 'T00:00:00') - new Date(todayISO() + 'T00:00:00')) / 864e5);
+  return d > 1 ? `อีก ${d} วัน` : d === 1 ? 'พรุ่งนี้' : d === 0 ? 'เข้าวันนี้' : 'มาถึงแล้ว';
+}
+const dateTH = iso => iso ? new Date(iso + 'T00:00:00').toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: '2-digit' }) : '';
+const SEEN_KEY = 'ann-seen';
+const annUnseen = () => { let t = ''; try { t = localStorage.getItem(SEEN_KEY) || ''; } catch { } return annShown().filter(a => a.updated_at > t).length; };
+const markAnnSeen = () => { const m = annShown().reduce((x, a) => a.updated_at > x ? a.updated_at : x, ''); if (m) try { localStorage.setItem(SEEN_KEY, m); } catch { } };
+// แถบตัวหนังสือวิ่งใต้หัวแอป (แตะเพื่อเปิดหน้าประกาศ)
+let tickerSig = '';
+function renderTicker() {
+  const el = $('#ticker'); if (!el) return;
+  const list = state.session ? annShown() : [];
+  const sig = list.map(a => a.id + a.updated_at).join();
+  if (sig === tickerSig) return; tickerSig = sig;
+  if (!list.length) { el.hidden = true; el.innerHTML = ''; return; }
+  const items = list.map(a => `<span class="tk-item k-${a.kind}"><b>${ANN_K[a.kind][0]} ${esc(a.title)}</b>${a.eta ? `<em>${etaText(a.eta)} · ${dateTH(a.eta)}</em>` : ''}</span>`).join('<span class="tk-sep">◆</span>');
+  const len = list.reduce((n, a) => n + a.title.length + 20, 0);
+  el.innerHTML = `<div class="tk-label">ประกาศ</div><div class="tk-win"><div class="tk-track" style="--dur:${Math.max(14, Math.round(len * 0.32))}s">${items}<span class="tk-sep">◆</span>${items}<span class="tk-sep">◆</span></div></div>`;
+  el.hidden = false;
+}
+function annCardHtml(a) {
+  const [ic, kt] = ANN_K[a.kind] || ANN_K.info, vis = annVisible(a);
+  const body = esc(a.body).replace(/\n/g, '<br>');
+  return `<article class="ann k-${a.kind} ${vis ? '' : 'off'}">
+    <div class="ann-top"><span class="ann-kind">${ic} ${kt}</span>${a.pinned ? '<span class="ann-pin">📌 ปักหมุด</span>' : ''}${!vis ? `<span class="ann-off">${a.active ? 'หมดเวลาแสดง' : 'ซ่อนอยู่'}</span>` : ''}</div>
+    <h3>${esc(a.title)}</h3>
+    ${a.eta ? `<div class="ann-eta"><b>${etaText(a.eta)}</b><span>คาดว่าเข้า ${dateTH(a.eta)}</span></div>` : ''}
+    ${body ? `<p>${body}</p>` : ''}
+    <footer>${esc(a.by_name || '')}${a.by_name ? ' · ' : ''}${fmt(a.updated_at)}${a.show_until ? ` · แสดงถึง ${dateTH(a.show_until)}` : ''}</footer>
+    ${isIssuer() ? `<div class="row" style="margin:10px 0 0"><button data-act="annEdit" data-id="${a.id}">✎ แก้ไข</button><button data-act="annToggle" data-id="${a.id}">${a.active ? '🙈 ซ่อน' : '👁 แสดง'}</button><button class="danger" data-act="annDel" data-id="${a.id}">ลบ</button></div>` : ''}
+  </article>`;
+}
+function annFormHtml() {
+  const e = state.annEdit, a = e && e !== 'new' ? state.anns.find(x => x.id === e) : null;
+  if (!e) return `<button class="primary big" data-act="annNew" style="margin:0 0 14px">＋ เขียนประกาศใหม่</button>`;
+  return `<section class="card ann-form"><h2>${a ? 'แก้ไขประกาศ' : 'เขียนประกาศใหม่'}</h2>
+    <label>ประเภท<div class="seg" style="margin:4px 0 0">${Object.entries(ANN_K).map(([k, [ic, t]]) => `<button data-act="annKind" data-k="${k}" class="${(a?.kind || state.annKind || 'new') === k ? 'on' : ''}">${ic} ${t}</button>`).join('')}</div></label>
+    <label>หัวข้อ * <small style="display:inline">(แสดงในแถบตัวหนังสือวิ่ง)</small><input id="anTitle" value="${esc(a?.title || '')}" placeholder="เช่น iPhone 17 Pro Max เข้า 20 เครื่อง"></label>
+    <label>รายละเอียด<textarea id="anBody" rows="4" style="font-family:var(--f);font-size:15px" placeholder="รุ่น / สี / ความจุ / จำนวน / วิธีขอเบิก ...">${esc(a?.body || '')}</textarea></label>
+    <div class="row" style="margin:0"><label style="margin:0">วันที่คาดว่าเข้า<input id="anEta" type="date" value="${a?.eta || ''}"></label><label style="margin:0">แสดงถึงวันที่<input id="anUntil" type="date" value="${a?.show_until || ''}"></label></div>
+    <label class="chk" style="margin-top:10px"><input type="checkbox" id="anPin" ${a?.pinned ? 'checked' : ''}> 📌 ปักหมุดไว้บนสุด</label>
+    <div class="row" style="margin:12px 0 0"><button data-act="annCancel">ยกเลิก</button><button class="primary" data-act="annSave">${a ? 'บันทึก' : 'ประกาศ'}</button></div></section>`;
+}
+function viewNews() {
+  markAnnSeen();
+  const list = isIssuer() ? state.anns : annShown();
+  return errBanner() + `<div class="news-hero"><div><small>ประกาศ</small><b>เครื่องเข้าใหม่ &amp; ข่าวสาร</b></div><span>${annShown().length}</span></div>
+    ${isIssuer() ? annFormHtml() : ''}
+    ${list.length ? list.map(annCardHtml).join('') : '<p class="muted center">ยังไม่มีประกาศ</p>'}`;
+}
+
+const views = { news: viewNews, request: viewRequest, requests: viewRequests, fulfill: viewFulfill, return: viewReturn, out: viewOut, stock: viewStock, history: viewHistory, settings: viewSettings };
 function render() {
   document.body.classList.toggle('noauth', !state.session);
   if (state.session) fixView();
@@ -605,10 +701,10 @@ function render() {
   $('#app').innerHTML = !configured ? viewSetup() : !state.session ? viewLogin() : views[state.view]();
   window.scrollTo(0, 0);
   if (state.session && state.view === 'settings' && isIssuer()) loadUsersInto();
-  if (/^(return|fulfill)$/.test(state.view) && matchMedia('(pointer:fine)').matches) $('.wedge')?.focus({ preventScroll: true });
 }
 function go(v) {
   if (!state.session || !allowed(v)) return;
+  document.querySelectorAll('dialog[open]').forEach(d => { try { d.close(); } catch { } }); // กันหน้าต่างค้างบังหน้า
   state.view = v; render();
   if (v === 'settings') return;
   refresh().then(() => {
@@ -616,6 +712,7 @@ function go(v) {
     if (v === 'request') { const a = $('#modelPick'); if (a) a.innerHTML = modelPickHtml(); const p = $('#people'); if (p) p.innerHTML = peopleOpts(); const s = $('#reqSum'); if (s) s.innerHTML = reqSumHtml(); renderNav(); }
     else if (v === 'fulfill' && curReq()?.status === 'PENDING') { renderFul(); renderNav(); }
     else if (v === 'return') { refreshReturnInPlace(); renderNav(); }
+    else if (v === 'news' && state.annEdit) renderNav();
     else render();
   });
 }
@@ -940,6 +1037,11 @@ const actions = {
     if (keep.length && !reason) { const i = $('#missReason'); if (i) { i.setCustomValidity('กรุณาระบุเหตุผล หรือเลือกจากตัวเลือกด้านล่าง'); i.reportValidity(); i.oninput = () => i.setCustomValidity(''); } return; }
     doReturn(keep, keep.length ? reason : '', sold);
   },
+  pickPerson: d => { if (state.retPerson !== d.p) { state.retPerson = d.p; state.cart.return = []; saveDraft(); } renderRetAll(); },
+  retClear: () => {
+    if (state.cart.return.length && !confirm(`ยิงไปแล้ว ${state.cart.return.length} เครื่อง — เปลี่ยนผู้เบิกจะล้างรายการที่ยิงไว้`)) return;
+    state.retPerson = ''; state.cart.return = []; state.retQ = ''; saveDraft(); renderRetAll();
+  },
   retPerson: d => {
     if (state.retPerson !== d.p) { state.retPerson = d.p; state.cart.return = []; saveDraft(); }
     if (dlg().open) dlg().close();
@@ -976,6 +1078,36 @@ const actions = {
   stockDlg: d => stockDlg(d.id),
   personDlg: d => personDlg(d.p),
   authTab: d => { state.authTab = d.t; render(); },
+  annNew: () => { state.annEdit = 'new'; state.annKind = 'new'; render(); setTimeout(() => $('#anTitle')?.focus(), 50); },
+  annEdit: d => { state.annEdit = +d.id; state.annKind = state.anns.find(a => a.id === +d.id)?.kind; render(); },
+  annCancel: () => { state.annEdit = null; render(); },
+  annKind: d => { state.annKind = d.k; document.querySelectorAll('.ann-form .seg button').forEach(b => b.classList.toggle('on', b.dataset.k === d.k)); },
+  annSave: () => guarded(async () => {
+    const e = state.annEdit, a = e && e !== 'new' ? state.anns.find(x => x.id === e) : null;
+    const title = $('#anTitle').value.trim(); if (!title) return toast('กรุณาใส่หัวข้อประกาศ', true);
+    await rpc('ann_save', { p_id: a ? a.id : null, p_title: title, p_body: $('#anBody').value, p_kind: state.annKind || 'new',
+      p_eta: $('#anEta').value || null, p_show_until: $('#anUntil').value || null, p_pinned: $('#anPin').checked, p_active: a ? a.active : true, p_by: opName() });
+    state.annEdit = null; await loadAnns(); render(); toast(a ? 'บันทึกประกาศแล้ว' : 'ประกาศแล้ว');
+  }),
+  annToggle: d => guarded(async () => {
+    const a = state.anns.find(x => x.id === +d.id); if (!a) return;
+    await rpc('ann_save', { p_id: a.id, p_title: a.title, p_body: a.body, p_kind: a.kind, p_eta: a.eta, p_show_until: a.show_until, p_pinned: a.pinned, p_active: !a.active, p_by: a.by_name });
+    await loadAnns(); render(); toast(a.active ? 'ซ่อนประกาศแล้ว' : 'แสดงประกาศแล้ว');
+  }),
+  annDel: d => guarded(async () => {
+    if (!confirm('ลบประกาศนี้?')) return;
+    await rpc('ann_delete', { p_id: +d.id }); await loadAnns(); render(); toast('ลบประกาศแล้ว');
+  }),
+  tickerGo: () => go('news'),
+  myPw: () => guarded(async () => {
+    const pw = $('#myPw').value; if (pw.length < 6) return toast('รหัสผ่านอย่างน้อย 6 ตัว', true);
+    await rpc('my_set_password', { p_password: pw }); $('#myPw').value = ''; toast('เปลี่ยนรหัสผ่านแล้ว');
+  }),
+  resetPw: d => {
+    const pw = prompt(`ตั้งรหัสผ่านใหม่ให้ ${d.n} (อย่างน้อย 6 ตัว)`); if (pw == null) return;
+    if (pw.length < 6) return toast('รหัสผ่านอย่างน้อย 6 ตัว', true);
+    guarded(async () => { await rpc('admin_set_password', { p_user: d.u, p_password: pw }); toast(`ตั้งรหัสใหม่ให้ ${d.n} แล้ว`); });
+  },
   saveMe: () => guarded(async () => {
     await rpc('profile_update', { p_name: $('#meName').value, p_dept: $('#meDept').value });
     await loadRole(); toast('บันทึกแล้ว');
@@ -985,11 +1117,7 @@ const actions = {
     if (!ID_RE.test(id)) return toast('ID ต้องเป็นตัวอังกฤษ/ตัวเลข 3–30 ตัว', true);
     if (!name) return toast('กรุณาใส่ชื่อ', true);
     if (pw.length < 6) return toast('รหัสผ่านอย่างน้อย 6 ตัว', true);
-    // ใช้ client แยก (ไม่เก็บ session) เพื่อไม่ให้ผู้จ่ายเบิกหลุดออกจากระบบ
-    const tmp = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false, storageKey: 'tmp-signup' } });
-    const { data, error } = await tmp.auth.signUp({ email: toEmail(id), password: pw, options: { data: { username: id.toLowerCase(), name } } });
-    if (error) return toast(authErr(error), true);
-    if (role === 'issuer' && data.user) await rpc('set_role', { p_user: data.user.id, p_role: 'issuer' });
+    await rpc('app_signup', { p_username: id, p_password: pw, p_name: name, p_dept: '', p_role: role });
     ['#nuId', '#nuName', '#nuPw'].forEach(x => $(x).value = '');
     toast(`เพิ่มผู้ใช้ ${id} แล้ว`); loadUsersInto();
   }),
@@ -1036,7 +1164,7 @@ const actions = {
   logout: async () => {
     if (!confirm('ออกจากระบบ?')) return;
     await sb.auth.signOut();
-    Object.assign(state, { session: null, role: 'requester', me: { name: '', dept: '', username: '' }, view: '', open: [], openMap: new Map(), docs: [], reqs: [], models: [], modelMap: new Map() });
+    Object.assign(state, { session: null, role: 'requester', me: { name: '', dept: '', username: '' }, anns: [], annEdit: null, view: '', open: [], openMap: new Map(), docs: [], reqs: [], models: [], modelMap: new Map() });
     render();
   },
   exportCsv: () => guarded(async () => {
@@ -1058,6 +1186,10 @@ document.addEventListener('click', e => {
 function onBind(e) {
   const t = e.target;
   if (t.dataset.qty) { if (e.type === 'input') setQty(+t.dataset.qty, t.value, false); else setQty(+t.dataset.qty, t.value); return; }
+  if (t.id === 'allowSignup' && e.type === 'change') {
+    guarded(async () => { try { await rpc('set_allow_signup', { p_on: t.checked }); state.signupOpen = t.checked; toast(t.checked ? 'เปิดให้สมัครเองแล้ว' : 'ปิดการสมัครเองแล้ว'); } catch (err) { t.checked = !t.checked; throw err; } });
+    return;
+  }
   if (t.dataset.roleUser && e.type === 'change') {
     guarded(async () => { try { await rpc('set_role', { p_user: t.dataset.roleUser, p_role: t.value }); toast('เปลี่ยนสิทธิ์แล้ว'); } catch (err) { loadUsersInto(); throw err; } });
     return;
@@ -1070,6 +1202,7 @@ function onBind(e) {
   else if (b === 'hq' || b === 'ht') renderHistoryList();
   else if (b === 'pq') renderReqList();
   else if (b === 'sq') renderStockList();
+  else if (b === 'retQ') { const pl = $('#plist'); if (pl) pl.innerHTML = plistHtml(); }
   else if (b === 'retPerson') {
     if (state.cart.return.some(x => x.person !== v)) state.cart.return = state.cart.return.filter(x => x.person === v);
     renderRet();
@@ -1114,8 +1247,10 @@ document.addEventListener('submit', e => {
       if (!name) return toast('กรุณาใส่ชื่อ-นามสกุล', true);
       if (pw.length < 6) return toast('รหัสผ่านอย่างน้อย 6 ตัว', true);
       if (pw !== String(f.get('password2'))) return toast('รหัสผ่านทั้งสองช่องไม่ตรงกัน', true);
-      res = await sb.auth.signUp({ email: toEmail(uid), password: pw, options: { data: { username: uid.toLowerCase(), name, dept: get('dept') } } });
-      if (!res.error && !res.data.session) return toast('สมัครแล้ว แต่ยังเข้าใช้ไม่ได้ — ผู้ดูแลต้องปิด “Confirm email” ใน Supabase', true);
+      // สร้างบัญชีผ่านฟังก์ชันในฐานข้อมูล (ไม่ติดการตรวจอีเมลของ Supabase) แล้วเข้าสู่ระบบทันที
+      const { error } = await sb.rpc('app_signup', { p_username: uid, p_password: pw, p_name: name, p_dept: get('dept') });
+      if (error) return toast(authErr(error), true);
+      res = await sb.auth.signInWithPassword({ email: toEmail(uid), password: pw });
     }
     if (res.error) return toast(authErr(res.error), true);
     state.session = res.data.session; state.view = ''; await refresh(); cleanDraft(); render();
@@ -1132,6 +1267,7 @@ addEventListener('online', setNet); addEventListener('offline', setNet);
   if (configured) {
     loadDraft();
     try { state.session = (await sb.auth.getSession()).data.session; } catch { }
+    await loadAppConfig();
     sb.auth.onAuthStateChange((ev, s) => { if (ev === 'SIGNED_OUT') { state.session = null; render(); } else if (s) state.session = s; });
     if (state.session) { await refresh(); cleanDraft(); }
   }

@@ -207,3 +207,61 @@ body.busy .cta button.primary,body.busy dialog button.primary{opacity:.6;cursor:
 dialog #toast{position:fixed;width:max-content;max-width:min(90vw,460px)}
 .danger-zone{border-color:#e8b4ab}
 .danger-zone h2::before{background:var(--red)}
+
+/* ===== v2.4: รับคืน — การ์ดผู้เบิก ===== */
+.plist{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;max-height:46vh;overflow:auto;padding:2px}
+.pbtn{display:flex;flex-direction:column;align-items:flex-start;gap:2px;text-align:left;padding:10px 12px;border-radius:8px;border:1.5px solid var(--line);background:#fbfcfc;min-height:60px}
+.pbtn b{font-size:15px;line-height:1.25;word-break:break-word}
+.pbtn span{font-size:13px;color:var(--mut)}.pbtn i{font-style:normal;font:600 15px var(--mono);color:var(--ink)}
+.pbtn em{font-style:normal;color:var(--red);font-weight:600}
+.pbtn:active{background:#fff6d6;border-color:var(--ink)}
+.who{display:flex;align-items:center;gap:10px;background:#fff6d6;border:1.5px solid var(--yel-d);border-radius:8px;padding:10px 12px}
+.who b{display:block;font-size:18px;line-height:1.3}
+.who button{flex:none}
+/* มือถือ: ไม่ขยับปุ่มตอนกด (กันกดไม่ติดตรงขอบปุ่ม) */
+@media (hover:none){button:active{transform:none}button.primary:active{box-shadow:3px 3px 0 var(--ink);filter:brightness(.93)}}
+/* v2.4: ป้ายคงเหลือในหน้าขอเบิก */
+.stk-tag{display:inline-block;margin-top:3px;font:600 12px var(--f);padding:1px 8px;border-radius:99px}
+.stk-tag.ok{background:#d6efe7;color:var(--grn)}.stk-tag.low{background:#ffecb0;color:#7a5600}.stk-tag.out{background:#f8d7d1;color:var(--red)}
+.pick .nm .stk-tag{display:table}
+
+/* ===== v2.4: แถบประกาศตัวหนังสือวิ่ง ===== */
+#ticker{display:flex;align-items:stretch;margin-top:6px;background:var(--ink);color:#fff;height:36px;cursor:pointer;overflow:hidden;border-bottom:2px solid var(--yel)}
+#ticker[hidden]{display:none!important}
+.tk-label{flex:none;display:flex;align-items:center;gap:6px;padding:0 12px 0 14px;background:var(--yel);color:var(--ink);font-weight:700;font-size:13.5px;position:relative;z-index:1}
+.tk-label::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--red);animation:tkpulse 1.4s ease-in-out infinite}
+.tk-label::after{content:"";position:absolute;right:-12px;top:0;bottom:0;width:12px;background:linear-gradient(90deg,var(--yel),transparent)}
+.tk-win{flex:1;overflow:hidden;display:flex;align-items:center;mask-image:linear-gradient(90deg,transparent,#000 24px,#000 calc(100% - 24px),transparent)}
+.tk-track{display:inline-flex;align-items:center;white-space:nowrap;animation:tick var(--dur,20s) linear infinite;padding-left:16px}
+#ticker:hover .tk-track,#ticker:active .tk-track{animation-play-state:paused}
+.tk-item{display:inline-flex;align-items:baseline;gap:8px;font-size:14px}
+.tk-item b{font-weight:600}
+.tk-item em{font-style:normal;font-size:12.5px;color:var(--yel);font-weight:600}
+.tk-item.k-urgent b{color:#ffb4a6}
+.tk-sep{color:var(--yel);opacity:.7;margin:0 18px;font-size:10px}
+@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+@keyframes tkpulse{50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.tk-track{animation:none}.tk-label::before{animation:none}}
+#nav button span{white-space:nowrap}
+
+/* ===== v2.4: หน้าประกาศ ===== */
+.news-hero{display:flex;justify-content:space-between;align-items:center;background:var(--ink);color:#fff;border-radius:10px;padding:16px 18px;margin-bottom:14px;position:relative;overflow:hidden}
+.news-hero::after{content:"";position:absolute;right:-30px;top:-30px;width:130px;height:130px;border-radius:50%;background:radial-gradient(circle,rgba(255,194,14,.45),transparent 70%)}
+.news-hero small{color:var(--yel);font-weight:600;letter-spacing:.08em}
+.news-hero b{display:block;font-size:20px;line-height:1.3}
+.news-hero>span{font:700 30px var(--mono);color:var(--yel);position:relative;z-index:1}
+.ann{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px 16px 12px;margin-bottom:14px;position:relative;overflow:hidden;border-top:5px solid var(--yel)}
+.ann.k-info{border-top-color:var(--blu)}.ann.k-urgent{border-top-color:var(--red)}
+.ann.k-new{background:linear-gradient(160deg,#fff7d9 0%,#fff 42%)}
+.ann.k-urgent{background:linear-gradient(160deg,#fde9e5 0%,#fff 42%)}
+.ann.off{opacity:.55}
+.ann-top{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.ann-kind{font-size:12.5px;font-weight:700;padding:2px 10px;border-radius:99px;background:var(--ink);color:var(--yel)}
+.ann.k-info .ann-kind{background:var(--blu);color:#fff}.ann.k-urgent .ann-kind{background:var(--red);color:#fff}
+.ann-pin,.ann-off{font-size:12px;font-weight:600;padding:2px 9px;border-radius:99px;background:var(--line2);color:var(--ink2)}
+.ann h3{font-size:19px;line-height:1.35;margin:10px 0 6px}
+.ann-eta{display:inline-flex;align-items:baseline;gap:10px;background:var(--ink);color:#fff;border-radius:8px;padding:6px 12px;margin-bottom:8px}
+.ann-eta b{color:var(--yel);font-size:16px}.ann-eta span{font-size:13px;color:#cfd6dc}
+.ann p{margin:4px 0 8px;line-height:1.65;color:var(--ink2)}
+.ann footer{font-size:12.5px;color:var(--mut)}
+.ann-form .seg button{font-size:13.5px}
