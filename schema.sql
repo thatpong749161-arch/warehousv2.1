@@ -318,6 +318,97 @@ begin
   delete from announcements where id = p_id;
 end $$;
 
+-- ───────── สต็อกแบบ IMEI (v2.5) ─────────
+-- 1 แถว = เครื่อง 1 IMEI · IN_STOCK อยู่ในคลัง / OUT ถูกเบิก / SOLD ขายแล้ว / REMOVED ตัดออก
+-- models.stock = จำนวนในคลังทั้งหมด (ทั้งที่ลง IMEI แล้ว และของเดิมที่ยังไม่ลง)
+-- จำนวนที่ยังไม่ลง IMEI = models.stock − จำนวน devices ที่ IN_STOCK ของรุ่นนั้น
+create table if not exists public.devices (
+  imei        text primary key,
+  model_id    bigint not null references public.models(id),
+  status      text not null default 'IN_STOCK' check (status in ('IN_STOCK','OUT','SOLD','REMOVED')),
+  received_at timestamptz not null default now(),
+  received_by text not null default '',
+  note        text not null default '',
+  updated_at  timestamptz not null default now()
+);
+create index if not exists devices_model_status_idx on public.devices(model_id, status);
+
+-- จำนวนพร้อมเบิกต่อรุ่น (ทุกคนเรียกได้): คงเหลือ − ที่คำขออื่นจองไว้ (รอจ่าย)
+create or replace function public.model_avail()
+returns table(model_id bigint, stock int, reserved int, avail int, registered int)
+language sql stable security definer set search_path = public as $$
+  select m.id, m.stock, coalesce(r.q, 0)::int, greatest(m.stock - coalesce(r.q, 0), 0)::int, coalesce(d.n, 0)::int
+  from models m
+  left join (select ri.model_id, sum(ri.qty) as q from request_items ri join requests rq on rq.req_no = ri.req_no
+             where rq.status = 'PENDING' group by ri.model_id) r on r.model_id = m.id
+  left join (select dv.model_id, count(*) as n from devices dv where dv.status = 'IN_STOCK' group by dv.model_id) d on d.model_id = m.id
+$$;
+
+-- รับเข้าด้วยการยิง IMEI
+-- p_mode: 'new' = รับเข้าใหม่ (สต็อกเพิ่ม) · 'register' = ลงทะเบียน IMEI ให้ของที่มีอยู่แล้ว (สต็อกไม่เปลี่ยน)
+create or replace function public.stock_receive(p_model_id bigint, p_imeis text[], p_mode text, p_note text, p_by text)
+returns int language plpgsql security definer set search_path = public as $$
+declare m models%rowtype; v_list text[]; v_n int; v_reg int; v_bad text; v_bal int; v_by text := coalesce(trim(p_by), '');
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  if p_mode not in ('new','register') then raise exception 'รูปแบบการรับเข้าไม่ถูกต้อง'; end if;
+  select * into m from models where id = p_model_id for update;
+  if not found then raise exception 'ไม่พบรุ่นนี้'; end if;
+  select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_list from unnest(coalesce(p_imeis, '{}')) x where trim(x) <> '';
+  v_n := cardinality(v_list);
+  if v_n = 0 then raise exception 'ยังไม่ได้ยิง IMEI'; end if;
+  select string_agg(x, ', ') into v_bad from unnest(v_list) x where x !~ '^[A-Z0-9-]{5,30}$';
+  if v_bad is not null then raise exception 'IMEI ไม่ถูกต้อง: %', v_bad; end if;
+  select string_agg(d.imei || ' (' || mm.name || ')', ', ') into v_bad
+  from devices d join models mm on mm.id = d.model_id where d.imei = any(v_list) and d.status = 'IN_STOCK';
+  if v_bad is not null then raise exception 'มีในสต็อกอยู่แล้ว: %', v_bad; end if;
+  select string_agg(imei || ' (' || person || ')', ', ') into v_bad from loans where imei = any(v_list) and returned_at is null;
+  if v_bad is not null then raise exception 'ถูกเบิกอยู่ (ต้องรับคืนก่อน): %', v_bad; end if;
+
+  select count(*) into v_reg from devices where model_id = p_model_id and status = 'IN_STOCK';
+  if p_mode = 'register' and m.stock - v_reg < v_n then
+    raise exception 'รุ่น % มีเครื่องที่ยังไม่ลง IMEI เหลือ % เครื่อง แต่ยิงมา % เครื่อง — ใช้ “รับเข้าใหม่” แทน', m.name, greatest(m.stock - v_reg, 0), v_n;
+  end if;
+
+  insert into devices(imei, model_id, status, received_by, note)
+  select x, p_model_id, 'IN_STOCK', v_by, coalesce(trim(p_note), '') from unnest(v_list) x
+  on conflict (imei) do update set model_id = excluded.model_id, status = 'IN_STOCK', received_at = now(),
+    received_by = excluded.received_by, note = excluded.note, updated_at = now();
+
+  if p_mode = 'new' then
+    update models set stock = stock + v_n where id = p_model_id returning stock into v_bal;
+    insert into stock_moves(model_id, delta, balance, reason, note, by_name)
+    values (p_model_id, v_n, v_bal, 'IN', trim(coalesce(p_note, '') || ' (ยิง IMEI ' || v_n || ' เครื่อง)'), v_by);
+  else
+    v_bal := m.stock;
+    insert into stock_moves(model_id, delta, balance, reason, note, by_name)
+    values (p_model_id, 0, v_bal, 'REG', 'ลงทะเบียน IMEI ' || v_n || ' เครื่อง', v_by);
+  end if;
+  return v_bal;
+end $$;
+
+-- ตัดเครื่องออกจากสต็อกด้วย IMEI (เสีย/สูญหาย/ย้ายคลัง)
+create or replace function public.stock_remove(p_imeis text[], p_note text, p_by text)
+returns int language plpgsql security definer set search_path = public as $$
+declare v_list text[]; v_bad text; rec record; v_bal int; v_n int := 0; v_by text := coalesce(trim(p_by), '');
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  if coalesce(trim(p_note), '') = '' then raise exception 'กรุณาระบุเหตุผลที่ตัดออก'; end if;
+  select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_list from unnest(coalesce(p_imeis, '{}')) x where trim(x) <> '';
+  if cardinality(v_list) = 0 then raise exception 'ยังไม่ได้เลือก IMEI'; end if;
+  select string_agg(x, ', ') into v_bad from unnest(v_list) x
+  where not exists (select 1 from devices d where d.imei = x and d.status = 'IN_STOCK');
+  if v_bad is not null then raise exception 'ไม่อยู่ในสต็อก: %', v_bad; end if;
+  for rec in select model_id, count(*)::int c from devices where imei = any(v_list) group by model_id loop
+    update models set stock = stock - rec.c where id = rec.model_id returning stock into v_bal;
+    insert into stock_moves(model_id, delta, balance, reason, note, by_name)
+    values (rec.model_id, -rec.c, v_bal, 'OUT', trim(p_note) || ' (IMEI ' || rec.c || ' เครื่อง)', v_by);
+    v_n := v_n + rec.c;
+  end loop;
+  update devices set status = 'REMOVED', note = trim(p_note), updated_at = now() where imei = any(v_list);
+  return v_n;
+end $$;
+
 -- ───────── รุ่น / สต็อก (ผู้จ่ายเบิก) ─────────
 create or replace function public.model_save(p_id bigint, p_name text, p_active boolean, p_stock int, p_by text)
 returns bigint language plpgsql security definer set search_path = public as $$
@@ -358,6 +449,10 @@ begin
   v_delta := case p_mode when 'add' then p_qty when 'sub' then -p_qty when 'set' then p_qty - m.stock end;
   if v_delta is null then raise exception 'รูปแบบการปรับไม่ถูกต้อง'; end if;
   if m.stock + v_delta < 0 then raise exception 'สต็อกไม่พอ (คงเหลือ %)', m.stock; end if;
+  if v_delta < 0 and m.stock + v_delta < (select count(*) from devices where model_id = p_model_id and status = 'IN_STOCK') then
+    raise exception 'ตัดได้เฉพาะเครื่องที่ยังไม่ลง IMEI (% เครื่อง) — เครื่องที่มี IMEI ให้ใช้ “ตัดออกด้วย IMEI”',
+      m.stock - (select count(*) from devices where model_id = p_model_id and status = 'IN_STOCK');
+  end if;
   update models set stock = stock + v_delta where id = p_model_id returning stock into v_bal;
   insert into stock_moves(model_id, delta, balance, reason, note, by_name)
   values (p_model_id, v_delta, v_bal,
@@ -371,13 +466,23 @@ end $$;
 create or replace function public.req_create(
   p_person text, p_dept text, p_purpose text, p_note text, p_by text, p_items jsonb)
 returns text language plpgsql security definer set search_path = public as $$
-declare v_no text; it jsonb; m models%rowtype; q int;
+declare v_no text; it jsonb; m models%rowtype; q int; rec record; v_av int;
 begin
   if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
   if coalesce(trim(p_person), '') = '' then raise exception 'กรุณาระบุผู้เบิก'; end if;
   if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
     raise exception 'ยังไม่ได้เลือกรุ่น';
   end if;
+  -- ขอได้ไม่เกินจำนวนพร้อมเบิก (คงเหลือ − ที่คำขออื่นจองไว้) · ล็อกรุ่นกันสองคนขอพร้อมกัน
+  for rec in select (x->>'model_id')::bigint as mid, sum((x->>'qty')::int) as q
+             from jsonb_array_elements(p_items) x group by 1 order by 1 loop
+    select * into m from models where id = rec.mid and active for update;
+    if not found then raise exception 'ไม่พบรุ่นที่เลือก (อาจถูกปิดใช้งาน)'; end if;
+    select a.avail into v_av from model_avail() a where a.model_id = rec.mid;
+    if rec.q > coalesce(v_av, 0) then
+      raise exception 'รุ่น % พร้อมเบิกเหลือ % เครื่อง (ขอ % เครื่อง)', m.name, coalesce(v_av, 0), rec.q;
+    end if;
+  end loop;
 
   v_no := next_doc_no('REQ');
   insert into requests(req_no, person, dept, purpose, note, by_name)
@@ -411,7 +516,7 @@ end $$;
 create or replace function public.req_fulfill(p_req_no text, p_by text, p_items jsonb)
 returns text language plpgsql security definer set search_path = public as $$
 declare
-  r requests%rowtype; ri request_items%rowtype; v_no text; it jsonb;
+  r requests%rowtype; ri request_items%rowtype; v_no text; it jsonb; dv devices%rowtype;
   v_imei text; v_model text; v_holder text; n int; rec record; v_bal int; v_by text := coalesce(trim(p_by),'');
 begin
   if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
@@ -435,6 +540,29 @@ begin
     update request_items set issued = n where id = ri.id;
   end loop;
 
+  -- ตรวจกับสต็อก IMEI: เครื่องที่ลงทะเบียนแล้วต้องอยู่ในคลังและเป็นรุ่นเดียวกับที่จ่าย
+  for it in select * from jsonb_array_elements(p_items) loop
+    v_imei := upper(trim(it->>'imei'));
+    select * into dv from devices where imei = v_imei for update;
+    if found then
+      if dv.status <> 'IN_STOCK' then
+        raise exception 'IMEI % %', v_imei, case dv.status when 'OUT' then 'ถูกเบิกอยู่แล้ว' when 'SOLD' then 'ขายไปแล้ว' else 'ถูกตัดออกจากสต็อกแล้ว' end;
+      end if;
+      if dv.model_id <> (it->>'model_id')::bigint then
+        raise exception 'IMEI % เป็นรุ่น % — ไม่ตรงกับรุ่นที่จ่าย', v_imei, (select name from models where id = dv.model_id);
+      end if;
+    end if;
+  end loop;
+  -- เครื่องที่ยังไม่ลง IMEI: จ่ายได้ไม่เกินจำนวนของเดิมที่ยังไม่ลงทะเบียนของรุ่นนั้น
+  for rec in select (x->>'model_id')::bigint as mid, count(*)::int as c from jsonb_array_elements(p_items) x
+             where not exists (select 1 from devices d where d.imei = upper(trim(x->>'imei'))) group by 1 loop
+    select stock - (select count(*) from devices where model_id = rec.mid and status = 'IN_STOCK') into n from models where id = rec.mid;
+    if rec.c > greatest(coalesce(n, 0), 0) then
+      raise exception 'รุ่น % มีเครื่องที่ไม่อยู่ในสต็อก IMEI % เครื่อง (ของเดิมที่ยังไม่ลง IMEI เหลือ %) — รับเข้าสต็อกด้วย IMEI ก่อน',
+        (select name from models where id = rec.mid), rec.c, greatest(coalesce(n, 0), 0);
+    end if;
+  end loop;
+
   v_no := next_doc_no('ISS');
   insert into documents(doc_no, type, person, dept, purpose, note, by_name, req_no)
   values (v_no, 'ISSUE', r.person, r.dept, r.purpose, r.note, v_by, p_req_no);
@@ -451,6 +579,9 @@ begin
       raise exception 'IMEI % ถูกเบิกอยู่แล้ว (ผู้เบิก: %)', v_imei, coalesce(v_holder, '-');
     end;
     insert into document_items(doc_no, imei, model) values (v_no, v_imei, v_model);
+    insert into devices(imei, model_id, status, received_by, note)
+    values (v_imei, (it->>'model_id')::bigint, 'OUT', v_by, 'ลงทะเบียนตอนจ่าย ' || v_no)
+    on conflict (imei) do update set status = 'OUT', updated_at = now();
   end loop;
 
   -- ตัดสต็อกตามจำนวนที่จ่ายจริง (ยอมให้ติดลบได้ เพราะเครื่องอยู่ในมือแล้ว — แอปจะแจ้งเตือน)
@@ -521,6 +652,13 @@ begin
     where imei = any(v_missing) and returned_at is null;
   end if;
 
+  -- สถานะเครื่องในสต็อก IMEI
+  insert into devices(imei, model_id, status, received_by, note)
+  select imei, model_id, case closed_reason when 'SOLD' then 'SOLD' else 'IN_STOCK' end, v_by,
+         case closed_reason when 'SOLD' then 'ขาย ' else 'รับคืน ' end || v_no
+  from loans where return_doc = v_no and model_id is not null
+  on conflict (imei) do update set status = excluded.status, model_id = excluded.model_id, note = excluded.note, updated_at = now();
+
   -- คืนเข้าคลัง → สต็อกเพิ่ม
   for rec in select model_id, count(*)::int as c from loans
              where return_doc = v_no and closed_reason = 'RETURN' and model_id is not null group by model_id loop
@@ -548,8 +686,9 @@ begin
   if coalesce(trim(p_confirm), '') <> 'ล้างข้อมูล' then raise exception 'คำยืนยันไม่ถูกต้อง — พิมพ์คำว่า ล้างข้อมูล'; end if;
   if p_scope = 'tx' then
     truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters restart identity;
+    delete from devices where status <> 'IN_STOCK'; -- เก็บเฉพาะเครื่องที่อยู่ในคลัง
   elsif p_scope = 'all' then
-    truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters, models restart identity;
+    truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters, devices, models restart identity;
   else
     raise exception 'ขอบเขตการล้างไม่ถูกต้อง';
   end if;
@@ -571,6 +710,7 @@ alter table public.requests       enable row level security;
 alter table public.request_items  enable row level security;
 alter table public.app_settings   enable row level security;
 alter table public.announcements  enable row level security;
+alter table public.devices        enable row level security;
 
 drop policy if exists "read documents"      on public.documents;
 drop policy if exists "read document_items" on public.document_items;
@@ -581,6 +721,7 @@ drop policy if exists "read stock_moves"    on public.stock_moves;
 drop policy if exists "read requests"       on public.requests;
 drop policy if exists "read request_items"  on public.request_items;
 drop policy if exists "read announcements"  on public.announcements;
+drop policy if exists "read devices"        on public.devices;
 
 -- ผู้จ่ายเบิกเห็นทุกอย่าง · ผู้เบิกเห็นเฉพาะคำขอ/ใบจ่าย/เครื่องของคำขอตัวเอง
 create policy "read profiles" on public.profiles for select to authenticated
@@ -590,6 +731,7 @@ create policy "read models" on public.models for select to authenticated using (
 create policy "read announcements" on public.announcements for select to authenticated
   using (is_issuer() or (active and (show_until is null or show_until >= (now() at time zone 'Asia/Bangkok')::date)));
 create policy "read stock_moves" on public.stock_moves for select to authenticated using (is_issuer());
+create policy "read devices" on public.devices for select to authenticated using (is_issuer());
 create policy "read requests" on public.requests for select to authenticated
   using (created_by = auth.uid() or is_issuer());
 create policy "read request_items" on public.request_items for select to authenticated
@@ -636,6 +778,14 @@ grant execute on function public.my_set_password(text)                         t
 revoke all on public.app_settings from anon, authenticated;
 revoke all on public.announcements from anon, authenticated;
 grant select on public.announcements to authenticated;
+revoke all on public.devices from anon, authenticated;
+grant select on public.devices to authenticated;
+revoke all on function public.model_avail()                                    from public, anon;
+revoke all on function public.stock_receive(bigint,text[],text,text,text)     from public, anon;
+revoke all on function public.stock_remove(text[],text,text)                   from public, anon;
+grant execute on function public.model_avail()                                 to authenticated;
+grant execute on function public.stock_receive(bigint,text[],text,text,text)  to authenticated;
+grant execute on function public.stock_remove(text[],text,text)                to authenticated;
 revoke all on function public.ann_save(bigint,text,text,text,date,date,boolean,boolean,text) from public, anon;
 revoke all on function public.ann_delete(bigint)                                             from public, anon;
 grant execute on function public.ann_save(bigint,text,text,text,date,date,boolean,boolean,text) to authenticated;

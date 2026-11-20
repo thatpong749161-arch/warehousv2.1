@@ -265,3 +265,74 @@ dialog #toast{position:fixed;width:max-content;max-width:min(90vw,460px)}
 .ann p{margin:4px 0 8px;line-height:1.65;color:var(--ink2)}
 .ann footer{font-size:12.5px;color:var(--mut)}
 .ann-form .seg button{font-size:13.5px}
+
+/* =====================================================================
+   v2.5 ธีมใหม่ — โทนดำ-เหลืองเดิม แต่นุ่มขึ้น อ่านง่ายขึ้น
+   ===================================================================== */
+:root{--bg:#eef1f4;--line:#d9dfe4;--line2:#e9edf0;--mut:#5b6873;--shadow:0 1px 2px rgba(16,24,32,.06),0 4px 14px rgba(16,24,32,.05)}
+html,body{font-size:15.5px}
+main{padding:18px 14px 8px}
+.card{border-radius:14px;border-color:var(--line);box-shadow:var(--shadow);padding:16px}
+.card.item{padding:13px 14px}
+h2{font-size:15.5px;letter-spacing:.005em;margin-bottom:12px}
+h2::before{height:18px;border-radius:3px}
+label{color:#3a4650;font-weight:600;font-size:13px}
+input,select,textarea{border-radius:10px;background:#fff;border-color:#cfd6dc}
+input::placeholder,textarea::placeholder{color:#9aa5ae}
+button{border-radius:10px;border-color:#c3cbd2;font-weight:600}
+button:not(.primary):not(.danger):not(.ghost):not(.iconbtn):hover{border-color:var(--ink)}
+button.primary{border-color:var(--ink)}
+button.danger{background:#fff5f3}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.big{border-radius:12px}
+.row{gap:8px}
+.badge{font-weight:700;letter-spacing:.01em}
+small{color:var(--mut)}
+.hint{margin:-4px 0 12px;padding:9px 12px;border-radius:10px;background:#fff8e1;border:1px solid #f4dc8c;color:#5a4a12;font-size:13.5px;line-height:1.5}
+.hint b{color:var(--ink)}
+.empty{display:flex;flex-direction:column;align-items:center;gap:4px;text-align:center;padding:26px 16px;color:var(--mut);background:#fff;border:1.5px dashed var(--line);border-radius:14px;margin-bottom:12px}
+.empty i{font-style:normal;font-size:30px;line-height:1.1;margin-bottom:4px}
+.empty b{color:var(--ink);font-size:15.5px}
+.empty span{font-size:13.5px}
+/* หัวแอป + เมนูล่าง */
+.top{box-shadow:0 2px 10px rgba(0,0,0,.18)}
+#nav{box-shadow:0 -4px 16px rgba(16,24,32,.18)}
+#nav button{padding:8px 0 7px;gap:3px}
+#nav button svg{padding:3px 12px;width:48px;height:30px;border-radius:99px;transition:background .15s}
+#nav button.on svg{background:rgba(255,194,14,.16)}
+#nav button.on::before{left:30%;right:30%;border-radius:0 0 3px 3px}
+/* รายการเอกสาร/คำขอ */
+.doc{border-left-width:5px}
+.doc .grow>b,.doc .code{font-weight:600}
+.side .bignum{font-size:24px}
+/* แถบยืนยันด้านล่าง */
+.cta{border-radius:16px;padding:12px 14px 14px}
+.cta .sum span{color:#aeb9c2}
+/* สถิติ */
+.stats div{border-radius:12px;padding:12px 14px;background:linear-gradient(150deg,#1b2733,#101820)}
+.stats b{font-size:24px}
+/* ตัวเลือกรุ่นหน้าขอเบิก */
+.pick{padding:12px;margin:0 -14px;border-left-width:4px}
+.pick.dis{opacity:.5}
+.pick.dis .step{border-color:#c3cbd2}
+.stk-sub{display:block;margin-top:2px;font-size:12px}
+.step{border-radius:10px}
+.step button:disabled{background:#f1f3f5;opacity:.5}
+/* สต็อก */
+.stk-name{font-size:16.5px}
+.stk-split{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 4px}
+.stk-split span{font-size:12.5px;font-weight:700;padding:2px 9px;border-radius:99px}
+.stk-split .ok{background:#e3f4ee;color:var(--grn)}.stk-split .warn{background:#fff1c2;color:#7a5600}
+.stk-act{margin:12px 0 0;display:grid;grid-template-columns:1.4fr 1fr 1fr auto;gap:6px}
+.stk-act button{padding:9px 8px;font-size:14px;white-space:nowrap}
+.stk-act button.primary{box-shadow:2px 2px 0 var(--ink)}
+.chip.unreg{background:#fff1c2;border-color:#f2d16b}
+/* การ์ดผู้เบิก/รุ่น */
+.pbtn{border-radius:12px;border-color:var(--line);background:#fff;box-shadow:0 1px 2px rgba(16,24,32,.05)}
+.who{border-radius:12px}
+.tile{border-radius:12px}
+dialog{border-radius:16px}
+#toast{border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+details>summary{list-style:none}details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"▸ ";color:var(--mut)}details[open]>summary::before{content:"▾ "}
+#toast{width:max-content;max-width:min(92vw,460px);text-align:center;line-height:1.45}

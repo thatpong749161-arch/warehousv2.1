@@ -11,10 +11,10 @@ const DOC_T = { ISSUE: 'จ่าย', RETURN: 'คืน' };
 const DOC_CLS = { ISSUE: 'warn', RETURN: 'ok' };
 const REQ_T = { PENDING: 'รอจ่าย', ISSUED: 'จ่ายแล้ว', CANCELLED: 'ยกเลิก' };
 const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
-const MOVE_T = { SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
+const MOVE_T = { REG: 'ลง IMEI ของเดิม', SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '2.4.0';
+const APP_VER = '2.5.0';
 // เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
 const ID_DOMAIN = 'loan.local';
 const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
@@ -31,6 +31,7 @@ const sb = configured ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPAB
 const state = {
   view: '', session: null, role: 'requester', me: { name: '', dept: '', username: '' }, authTab: 'login', signupOpen: true, operator: '', busy: false, loadErr: '',
   models: [], modelMap: new Map(), reqs: [], reqLimit: 200, anns: [], annEdit: null,
+  avail: new Map(), devMap: new Map(), rcv: { model_id: null, mode: 'new', items: [], note: '' }, rcvQ: '', imeiQ: '',
   open: [], openMap: new Map(), docs: [], docsLimit: 300,
   req: { person: '', dept: '', purpose: '', note: '', qty: {} },
   ful: null, // { no, items: [{ imei, model_id }], cur: model_id }
@@ -53,14 +54,14 @@ const NAV = {
   requester: [['request', 'ขอเบิก', 'req'], ['requests', 'คำขอของฉัน', 'list'], ['news', 'ประกาศ', 'news']],
   issuer: [['requests', 'คำขอ', 'list'], ['return', 'รับคืน', 'ret'], ['out', 'ค้างอยู่', 'dev'], ['stock', 'สต็อก', 'box'], ['news', 'ประกาศ', 'news'], ['history', 'ประวัติ', 'hist']]
 };
-const EXTRA = { requester: ['settings'], issuer: ['request', 'fulfill', 'settings'] };
+const EXTRA = { requester: ['settings'], issuer: ['request', 'fulfill', 'receive', 'settings'] };
 const allowed = v => NAV[state.role].some(x => x[0] === v) || EXTRA[state.role].includes(v);
 const fixView = () => { if (!allowed(state.view)) state.view = NAV[state.role][0][0]; };
 
 function renderNav() {
   const pend = state.reqs.filter(r => r.status === 'PENDING').length;
   const badge = { requests: pend, out: state.open.length, news: annUnseen() };
-  const on = v => state.view === v || (v === 'requests' && state.view === 'fulfill');
+  const on = v => state.view === v || (v === 'requests' && state.view === 'fulfill') || (v === 'stock' && state.view === 'receive');
   $('#nav').innerHTML = state.session ? NAV[state.role].map(([v, t, i]) => `<button data-view="${v}" class="${on(v) ? 'on' : ''}" data-n="${badge[v] || ''}"><svg viewBox="0 0 24 24">${IC[i]}</svg><span>${t}</span></button>`).join('') : '';
   renderTicker();
   const rb = $('#role'); if (rb) { rb.hidden = !state.session; rb.textContent = ROLE_T[state.role]; rb.className = 'badge' + (isIssuer() ? ' warn' : ''); }
@@ -103,17 +104,19 @@ const opName = () => state.operator.trim() || state.me.name || state.me.username
 const daysSince = d => Math.max(0, Math.floor((Date.now() - new Date(d)) / 864e5));
 const reqQty = r => r.request_items.reduce((a, i) => a + i.qty, 0);
 const reqIssued = r => r.request_items.reduce((a, i) => a + (i.issued || 0), 0);
-const saveDraft = () => { try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ req: state.req, ful: state.ful, ret: state.cart.return, rnote: state.rnote, retPerson: state.retPerson })); } catch { } };
+const saveDraft = () => { try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ req: state.req, ful: state.ful, ret: state.cart.return, rnote: state.rnote, retPerson: state.retPerson, rcv: state.rcv })); } catch { } };
 function loadDraft() {
   try {
     const d = JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null'); if (!d) return;
     Object.assign(state.req, d.req || {}); state.req.qty = d.req?.qty || {};
     state.ful = d.ful || null; state.cart.return = d.ret || [];
     state.rnote = d.rnote || ''; state.retPerson = d.retPerson || '';
+    if (d.rcv) state.rcv = Object.assign({ model_id: null, mode: 'new', items: [], note: '' }, d.rcv);
   } catch { }
 }
 function cleanDraft() {
-  Object.keys(state.req.qty).forEach(id => { if (!state.modelMap.get(+id)?.active) delete state.req.qty[id]; });
+  Object.keys(state.req.qty).forEach(id => { if (!state.modelMap.get(+id)?.active) delete state.req.qty[id]; else if (state.req.qty[id] > availOf(+id)) { const a = availOf(+id); if (a > 0) state.req.qty[id] = a; else delete state.req.qty[id]; } });
+  state.rcv.items = (state.rcv.items || []).filter(x => !state.devMap.has(x) && !state.openMap.has(x));
   if (state.ful && (!isIssuer() || state.reqs.find(r => r.req_no === state.ful.no)?.status !== 'PENDING')) state.ful = null;
   state.cart.return = isIssuer() ? state.cart.return.filter(l => state.openMap.has(l.imei)) : [];
   saveDraft();
@@ -139,6 +142,19 @@ async function loadRole() {
   state.role = data?.role === 'issuer' ? 'issuer' : 'requester';
   state.me = { name: data?.name || '', dept: data?.dept || '', username: data?.username || showId(state.session.user.email) };
 }
+// จำนวนพร้อมเบิก/ลง IMEI แล้ว ต่อรุ่น (ทุกคน) · รายการ IMEI ในคลัง (ผู้จ่ายเบิก)
+async function loadAvail() {
+  const { data, error } = await sb.rpc('model_avail');
+  if (error) throw error;
+  state.avail = new Map((data || []).map(r => [r.model_id, r]));
+}
+async function loadDevices() {
+  const rows = await fetchAll((a, b) => sb.from('devices').select('imei,model_id').eq('status', 'IN_STOCK').order('imei').range(a, b));
+  state.devMap = new Map(rows.map(d => [d.imei, d.model_id]));
+}
+const availOf = id => state.avail.get(id)?.avail ?? (state.modelMap.get(id)?.stock || 0);
+const regOf = id => state.avail.get(id)?.registered ?? 0;
+const unregOf = id => Math.max(0, (state.modelMap.get(id)?.stock || 0) - regOf(id));
 async function loadAnns() {
   const { data, error } = await sb.from('announcements').select('*').order('pinned', { ascending: false }).order('created_at', { ascending: false }).limit(100);
   if (error) throw error;
@@ -168,8 +184,8 @@ async function refresh() {
   if (!sb || !state.session) return;
   try {
     await loadRole();
-    const jobs = [loadModels(), loadReqs(), loadAppConfig(), loadAnns()];
-    if (isIssuer()) jobs.push(loadOpen(), loadDocs()); else { state.open = []; state.openMap = new Map(); state.docs = []; }
+    const jobs = [loadModels(), loadReqs(), loadAppConfig(), loadAnns(), loadAvail()];
+    if (isIssuer()) jobs.push(loadOpen(), loadDocs(), loadDevices()); else { state.open = []; state.openMap = new Map(); state.docs = []; state.devMap = new Map(); }
     await Promise.all(jobs); state.loadErr = '';
   } catch (e) { state.loadErr = errMsg(e); }
   fixView();
@@ -248,7 +264,7 @@ function normImei(raw) {
   if (!state.loose) { const m = s.match(/\d{15}/); if (m) s = m[0]; }
   return s.toUpperCase();
 }
-const addImei = (kind, raw) => kind === 'ful' ? addFul(raw) : addReturn(raw);
+const addImei = (kind, raw) => kind === 'ful' ? addFul(raw) : kind === 'rcv' ? addRcv(raw) : addReturn(raw);
 
 const retLoans = () => state.retPerson ? state.open.filter(l => l.person === state.retPerson) : [];
 const retMissing = () => { const got = new Set(state.cart.return.map(x => x.imei)); return retLoans().filter(l => !got.has(l.imei)); };
@@ -265,24 +281,39 @@ function addReturn(raw) {
   return `✓ ${s}${loan.model ? ' · ' + loan.model : ''} (${c.length}/${retLoans().length})`;
 }
 
-/* จ่ายตามคำขอ: IMEI เข้ารุ่นที่เลือกอยู่ ครบแล้วเลื่อนไปรุ่นถัดไปอัตโนมัติ */
+/* จ่ายตามคำขอ: ยิงได้เลย — ระบบหารุ่นจาก IMEI ในสต็อกเอง (กันยิงผิดรุ่น)
+   เครื่องเดิมที่ยังไม่ลง IMEI: ใส่ในรุ่นที่แตะเลือกไว้ (หรือรุ่นเดียวที่ยังมีของไม่ลง IMEI) */
 const curReq = () => state.ful && state.reqs.find(r => r.req_no === state.ful.no);
 const fulCnt = id => state.ful.items.filter(x => x.model_id === id).length;
+const fulUnregUsed = id => state.ful.items.filter(x => x.model_id === id && x.unreg).length;
+const mName = id => state.modelMap.get(id)?.name || '-';
 function addFul(raw) {
   const r = curReq(); if (!r || r.status !== 'PENDING') return '✗ คำขอนี้ไม่ได้รอจ่ายแล้ว';
-  const f = state.ful, s = normImei(raw);
+  const f = state.ful, s = normImei(raw), lines = r.request_items;
   if (!validImei(s)) return `✗ ${s} ไม่ใช่ IMEI ที่ถูกต้อง (15 หลัก)`;
-  if (f.items.some(x => x.imei === s)) return `✗ สแกน ${s} ซ้ำ`;
+  if (f.items.some(x => x.imei === s)) return `✗ ยิง ${s} ซ้ำ`;
   const loan = state.openMap.get(s);
   if (loan) return `✗ ${s} ถูกเบิกอยู่แล้ว (${loan.person})`;
-  const lines = r.request_items;
-  const line = lines.find(l => l.model_id === f.cur && fulCnt(l.model_id) < l.qty) || lines.find(l => fulCnt(l.model_id) < l.qty);
-  if (!line) return '✗ จ่ายครบทุกรุ่นตามคำขอแล้ว';
-  f.items.push({ imei: s, model_id: line.model_id });
-  const n = fulCnt(line.model_id);
-  f.cur = n >= line.qty ? (lines.find(l => fulCnt(l.model_id) < l.qty)?.model_id ?? line.model_id) : line.model_id;
+  const nextCur = () => { f.cur = lines.find(l => fulCnt(l.model_id) < l.qty)?.model_id ?? f.cur; };
+  const dev = state.devMap.get(s);
+  if (dev != null) {
+    const line = lines.find(l => l.model_id === dev);
+    if (!line) return `✗ ${s} เป็นรุ่น ${mName(dev)} — ไม่อยู่ในคำขอนี้`;
+    if (fulCnt(dev) >= line.qty) return `✗ ${s} รุ่น ${line.model} ครบ ${line.qty}/${line.qty} แล้ว`;
+    f.items.push({ imei: s, model_id: dev });
+    if (fulCnt(dev) >= line.qty) nextCur();
+    renderFul(); saveDraft();
+    return `✓ ${s} · ${line.model} (${fulCnt(dev)}/${line.qty})`;
+  }
+  // ไม่พบในสต็อก IMEI → ใช้ได้เฉพาะของเดิมที่ยังไม่ลง IMEI
+  const cand = lines.filter(l => fulCnt(l.model_id) < l.qty && unregOf(l.model_id) - fulUnregUsed(l.model_id) > 0);
+  if (!cand.length) return `✗ ${s} ไม่มีในสต็อก — รับเข้าสต็อกด้วย IMEI ก่อน (เมนูสต็อก)`;
+  const line = cand.find(l => l.model_id === f.cur) || (cand.length === 1 ? cand[0] : null);
+  if (!line) return `✗ ${s} ยังไม่ได้ลง IMEI — แตะเลือกรุ่นที่จะใส่ก่อน แล้วยิงใหม่`;
+  f.items.push({ imei: s, model_id: line.model_id, unreg: true });
+  if (fulCnt(line.model_id) >= line.qty) nextCur();
   renderFul(); saveDraft();
-  return `✓ ${s} · ${line.model} (${n}/${line.qty})`;
+  return `✓ ${s} · ${line.model} (${fulCnt(line.model_id)}/${line.qty}) · เครื่องเดิมไม่ลง IMEI`;
 }
 
 const scanBox = (kind, bulk = true) => `
@@ -364,16 +395,18 @@ const peopleList = () => [...new Set([...state.reqs.map(r => r.person), ...state
 const peopleOpts = () => peopleList().map(x => `<option value="${esc(x)}">`).join('');
 
 /* ขอเบิก: เลือกรุ่น + จำนวน */
-// ป้ายจำนวนคงเหลือ (ผู้เบิกเห็นด้วย — ขอเกินคงเหลือได้ ผู้จ่ายเบิกจะพิจารณาเอง)
-const stockTag = n => `<span class="stk-tag ${n <= 0 ? 'out' : n <= 3 ? 'low' : 'ok'}">${n <= 0 ? 'หมด' : 'คงเหลือ ' + num(n)}${n > 0 && n <= 3 ? ' · ใกล้หมด' : ''}</span>`;
+// ป้ายจำนวนพร้อมเบิก = คงเหลือ − ที่คำขออื่นจองไว้ · ขอได้ไม่เกินจำนวนนี้
+const stockTag = id => { const n = availOf(id), a = state.avail.get(id);
+  return `<span class="stk-tag ${n <= 0 ? 'out' : n <= 3 ? 'low' : 'ok'}">${n <= 0 ? 'หมด' : 'พร้อมเบิก ' + num(n)}${n > 0 && n <= 3 ? ' · ใกล้หมด' : ''}</span>`
+    + (isIssuer() && a ? `<small class="stk-sub">คงเหลือ ${num(a.stock)}${a.reserved ? ` · จองแล้ว ${num(a.reserved)}` : ''}</small>` : ''); };
 function modelPickHtml() {
   const q = state.mq.trim().toLowerCase();
   const ms = state.models.filter(m => m.active);
-  if (!ms.length) return `<p class="muted center">ยังไม่มีรุ่นเครื่องให้เลือก${isIssuer() ? ' — เพิ่มรุ่นได้ที่เมนู “สต็อก”' : ' — ติดต่อผู้จ่ายเบิกให้เพิ่มรุ่น'}</p>`;
+  if (!ms.length) return `<div class="empty"><i>📦</i><b>ยังไม่มีรุ่นเครื่องให้เลือก</b><span>${isIssuer() ? 'เพิ่มรุ่นได้ที่เมนู “สต็อก”' : 'ติดต่อผู้จ่ายเบิกให้เพิ่มรุ่น'}</span></div>`;
   const list = ms.filter(m => !q || m.name.toLowerCase().includes(q) || state.req.qty[m.id]);
-  return list.map(m => { const n = state.req.qty[m.id] || 0; return `<div class="pick ${n ? 'on' : ''}" id="pk-${m.id}">
-    <div class="nm">${esc(m.name)}${stockTag(m.stock)}</div>
-    <div class="step"><button data-act="qty" data-id="${m.id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="999" data-qty="${m.id}" value="${n || ''}" placeholder="0" aria-label="จำนวน ${esc(m.name)}"><button data-act="qty" data-id="${m.id}" data-d="1" aria-label="เพิ่ม">+</button></div></div>`; }).join('')
+  return list.sort((a, b) => (availOf(b.id) > 0) - (availOf(a.id) > 0)).map(m => { const n = state.req.qty[m.id] || 0, av = availOf(m.id); return `<div class="pick ${n ? 'on' : ''} ${av <= 0 && !n ? 'dis' : ''}" id="pk-${m.id}">
+    <div class="nm">${esc(m.name)}${stockTag(m.id)}</div>
+    <div class="step"><button data-act="qty" data-id="${m.id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="${av}" data-qty="${m.id}" value="${n || ''}" placeholder="0" ${av <= 0 && !n ? 'disabled' : ''} aria-label="จำนวน ${esc(m.name)}"><button data-act="qty" data-id="${m.id}" data-d="1" ${n >= av ? 'disabled' : ''} aria-label="เพิ่ม">+</button></div></div>`; }).join('')
     || '<p class="muted center">ไม่พบรุ่นที่ค้นหา</p>';
 }
 const reqLines = () => Object.entries(state.req.qty).filter(([id, n]) => n > 0 && state.modelMap.get(+id)?.active).map(([id, n]) => ({ model_id: +id, qty: n }));
@@ -383,9 +416,11 @@ function reqSumHtml() {
 }
 function setQty(id, n, syncInput = true) {
   n = Math.max(0, Math.min(999, Math.floor(+n || 0)));
+  const av = availOf(+id);
+  if (id && n > av) { n = av; syncInput = true; toast(av > 0 ? `${mName(+id)} พร้อมเบิกได้สูงสุด ${av} เครื่อง` : `${mName(+id)} หมดแล้ว`, true); }
   if (n) state.req.qty[id] = n; else delete state.req.qty[id];
   const row = $('#pk-' + id);
-  if (row) { row.classList.toggle('on', n > 0); if (syncInput) row.querySelector('input').value = n || ''; }
+  if (row) { row.classList.toggle('on', n > 0); if (syncInput) row.querySelector('input').value = n || ''; const plus = row.querySelector('[data-d="1"]'); if (plus) plus.disabled = n >= av; }
   const s = $('#reqSum'); if (s) s.innerHTML = reqSumHtml();
   saveDraft();
 }
@@ -400,6 +435,7 @@ function viewRequest() {
     <label>วัตถุประสงค์การใช้<input data-bind="req.purpose" value="${esc(r.purpose)}"></label>
     <label style="margin-bottom:0">หมายเหตุ<input data-bind="req.note" value="${esc(r.note)}"></label></section>
   <section class="card"><h2>เลือกรุ่นและจำนวน</h2>
+    <p class="hint">ขอได้ไม่เกินจำนวน “พร้อมเบิก” ของแต่ละรุ่น</p>
     ${state.models.filter(m => m.active).length > 6 ? `<input data-bind="mq" placeholder="ค้นหารุ่น" value="${esc(state.mq)}" style="margin:0 0 6px">` : ''}
     <div id="modelPick">${modelPickHtml()}</div></section>
   <div class="cta"><div class="sum" id="reqSum">${reqSumHtml()}</div>
@@ -412,7 +448,7 @@ function reqListHtml() {
   const q = state.pq.trim().toLowerCase(), s = state.rq;
   const list = state.reqs.filter(r => (!s || r.status === s) && (!q || [r.req_no, r.person, r.dept, r.purpose, r.note, r.issue_doc, ...r.request_items.map(i => i.model)].some(x => String(x || '').toLowerCase().includes(q))));
   const more = state.reqs.length >= state.reqLimit ? '<button data-act="moreReqs" style="width:100%">โหลดเพิ่ม</button>' : '';
-  if (!list.length) return '<p class="muted center">ไม่มีคำขอ</p>' + more;
+  if (!list.length) return '<div class="empty"><i>🗂️</i><b>ไม่มีคำขอในหมวดนี้</b><span>ลองเปลี่ยนแท็บด้านบน หรือค้นหาด้วยคำอื่น</span></div>' + more;
   return list.map(r => `<div class="card item doc s-${r.status}" data-act="viewReq" data-no="${esc(r.req_no)}"><div class="line" style="border:0;padding:0"><div class="grow">
     <span class="badge ${REQ_CLS[r.status]}">${REQ_T[r.status]}</span> <b class="code">${esc(r.req_no)}</b>
     <small><b>${esc(r.person)}</b>${r.dept ? ' · ' + esc(r.dept) : ''} · ${fmt(r.created_at)}</small>
@@ -438,8 +474,9 @@ function fulLinesHtml() {
     return `<div class="tile ${f.cur === l.model_id ? 'cur' : ''} ${n >= l.qty ? 'done' : ''}" data-act="setCur" data-id="${l.model_id}">
       <div class="tl"><b>${esc(l.model)}</b><span class="cnt">${n}<i>/${l.qty}</i></span></div>
       <div class="bar"><i style="width:${Math.min(100, n / l.qty * 100)}%"></i></div>
-      ${m && m.stock < l.qty ? `<small class="warn-t">⚠ สต็อกในระบบเหลือ ${num(m.stock)}</small>` : ''}
-      ${its.length ? `<div class="chips">${its.map(x => `<span class="chip">${esc(x.imei)}<button data-act="fulDel" data-imei="${esc(x.imei)}" aria-label="ลบ">✕</button></span>`).join('')}</div>` : ''}
+      ${unregOf(l.model_id) ? `<small class="muted">ของเดิมไม่ลง IMEI ${unregOf(l.model_id) - fulUnregUsed(l.model_id)} เครื่อง — แตะการ์ดนี้ก่อนยิงเครื่องเหล่านั้น</small>` : ''}
+      ${m && m.stock < l.qty ? `<small class="warn-t">⚠ คงเหลือในคลัง ${num(m.stock)}</small>` : ''}
+      ${its.length ? `<div class="chips">${its.map(x => `<span class="chip ${x.unreg ? 'unreg' : ''}">${esc(x.imei)}<button data-act="fulDel" data-imei="${esc(x.imei)}" aria-label="ลบ">✕</button></span>`).join('')}</div>` : ''}
     </div>`;
   }).join('');
 }
@@ -458,12 +495,12 @@ function viewFulfill() {
   return errBanner() + back + `<section class="card"><h2>จ่ายตามคำขอ <span class="code">${esc(r.req_no)}</span></h2>
     <p style="margin:0"><b>${esc(r.person)}</b>${r.dept ? ' · ' + esc(r.dept) : ''}</p>
     <small>${fmt(r.created_at)}${r.purpose ? ' · ' + esc(r.purpose) : ''}${r.note ? ' · ' + esc(r.note) : ''}</small></section>
-  <section class="card"><h2>สแกน IMEI ทีละเครื่อง</h2>
-    <small style="margin:-4px 0 10px">แตะเลือกรุ่นที่กำลังสแกน · ครบจำนวนแล้วระบบเลื่อนไปรุ่นถัดไปให้เอง</small>
+  <section class="card"><h2>ยิง IMEI ได้เลย</h2>
+    <p class="hint">ยิงเครื่องไหนก็ได้ ไม่ต้องเรียงรุ่น — ระบบดูจาก IMEI ว่าเป็นรุ่นอะไร แล้วใส่ให้เอง · ยิงผิดรุ่นหรือเกินจำนวนระบบจะไม่รับ</p>
     <div id="fulLines">${fulLinesHtml()}</div>
     <div style="margin-top:14px">${scanBox('ful')}</div></section>
   <div class="cta"><div class="sum" id="fulSum">${fulSumHtml()}</div>
-    <button class="primary big" data-act="commitFul">✅ ยืนยันการจ่าย</button></div>`;
+    <button class="primary big" data-act="commitFul">✅ ยืนยันจ่ายเครื่อง</button></div>`;
 }
 
 /* รับคืน: เลือกผู้เบิก → เห็น IMEI ทั้งหมด → ยิงอย่างเดียว */
@@ -525,7 +562,7 @@ function outListHtml() {
       <small><span class="badge ${n >= 7 ? 'err' : 'warn'}">${n === 0 ? 'วันนี้' : 'นานสุด ' + n + ' วัน'}</span> · ${g.docs.size} ใบจ่าย${g.notes ? ` · <span class="warn-t">มีเหตุผลค้าง ${g.notes}</span>` : ''}</small></div>
     <div class="side"><b class="bignum">${g.items.length}</b><small>เครื่อง</small>
       <button class="primary sm" data-act="retPerson" data-p="${esc(g.person)}">รับคืน</button></div></div></div>`; }).join('')
-    : '<p class="muted center">ไม่พบรายการ</p>';
+    : '<div class="empty"><i>✅</i><b>ไม่มีเครื่องค้าง</b><span>ทุกเครื่องคืนครบแล้ว</span></div>';
 }
 const renderOutList = () => { const e = $('#outList'); if (e) e.innerHTML = outListHtml(); };
 function viewOut() {
@@ -544,31 +581,90 @@ function personDlg(p) {
     <button class="big" data-act="closeDlg">ปิด</button>`);
 }
 
-/* สต็อก (นับจำนวน) */
+/* สต็อก: จำนวนรวม + แยกที่ลง IMEI แล้ว / ของเดิมที่ยังไม่ลง */
 function stockListHtml() {
   const q = state.sq.trim().toLowerCase();
   const out = new Map(); state.open.forEach(l => l.model_id && out.set(l.model_id, (out.get(l.model_id) || 0) + 1));
-  const need = new Map(); state.reqs.filter(r => r.status === 'PENDING').forEach(r => r.request_items.forEach(i => need.set(i.model_id, (need.get(i.model_id) || 0) + i.qty)));
-  const list = state.models.filter(m => !q || m.name.toLowerCase().includes(q)).sort((a, b) => b.active - a.active);
-  if (!list.length) return `<p class="muted center">${state.models.length ? 'ไม่พบรุ่นที่ค้นหา' : 'ยังไม่มีรุ่น — เพิ่มรุ่นแรกด้านบน'}</p>`;
-  return list.map(m => { const nd = need.get(m.id) || 0, o = out.get(m.id) || 0;
+  const list = state.models.filter(m => !q || m.name.toLowerCase().includes(q)).sort((a, b) => b.active - a.active || a.name.localeCompare(b.name, 'th'));
+  if (!list.length) return `<div class="empty"><b>${state.models.length ? 'ไม่พบรุ่นที่ค้นหา' : 'ยังไม่มีรุ่นเครื่อง'}</b>${state.models.length ? '' : '<span>เพิ่มรุ่นแรกได้จากฟอร์มด้านบน</span>'}</div>`;
+  return list.map(m => { const a = state.avail.get(m.id) || {}, o = out.get(m.id) || 0, reg = regOf(m.id), un = unregOf(m.id), res = a.reserved || 0;
     return `<div class="card item stk ${m.active ? '' : 'off'}"><div class="line" style="border:0;padding:0">
-    <div class="grow"><b>${esc(m.name)}</b> ${m.active ? '' : '<span class="badge">ปิดใช้งาน</span>'}
-      <small>ถูกเบิกอยู่ ${o} · รอจ่าย ${nd}${nd > m.stock ? ' · <b style="color:var(--red)">ไม่พอจ่าย</b>' : ''}</small></div>
+    <div class="grow"><b class="stk-name">${esc(m.name)}</b> ${m.active ? '' : '<span class="badge">ปิดใช้งาน</span>'}
+      <div class="stk-split"><span class="ok">📱 ลง IMEI ${num(reg)}</span>${un ? `<span class="warn">ยังไม่ลง IMEI ${num(un)}</span>` : ''}</div>
+      <small>ถูกเบิกอยู่ ${o}${res ? ` · จองแล้ว ${res}` : ''}${res > m.stock ? ' · <b style="color:var(--red)">ไม่พอจ่าย</b>' : ''}</small></div>
     <div class="side"><b class="bignum ${m.stock <= 0 ? 'neg' : ''}">${num(m.stock)}</b><small>คงเหลือ</small></div></div>
-    <div class="row" style="margin:10px 0 0"><button data-act="stockDlg" data-id="${m.id}">± ปรับสต็อก</button><button data-act="modelDlg" data-id="${m.id}">✎ แก้ไขรุ่น</button></div></div>`;
+    <div class="row stk-act"><button class="primary" data-act="rcvGo" data-id="${m.id}">📥 รับเข้า IMEI</button><button data-act="imeiDlg" data-id="${m.id}">📋 IMEI</button>
+      <button data-act="stockDlg" data-id="${m.id}">± จำนวน</button><button data-act="modelDlg" data-id="${m.id}" aria-label="แก้ไขรุ่น">✎</button></div></div>`;
   }).join('');
 }
 const renderStockList = () => { const e = $('#stockList'); if (e) e.innerHTML = stockListHtml(); };
 function viewStock() {
-  const act = state.models.filter(m => m.active), tot = act.reduce((a, m) => a + m.stock, 0);
-  return errBanner() + `<section class="card"><h2>เพิ่มรุ่นใหม่</h2>
-    <div class="row" style="margin:0"><label style="flex:2;margin:0">ชื่อรุ่น<input data-bind="newModel" value="${esc(state.newModel)}" placeholder="เช่น iPhone 15 128GB"></label>
-    <label style="margin:0">สต็อกเริ่มต้น<input data-bind="newQty" type="number" inputmode="numeric" min="0" value="${esc(state.newQty)}" placeholder="0"></label></div>
-    <button class="primary big" data-act="addModel">＋ เพิ่มรุ่น</button></section>
-  <div class="stats"><div><b>${act.length}</b><small>รุ่นที่ใช้งาน</small></div><div><b>${num(tot)}</b><small>สต็อกคงเหลือ</small></div><div><b>${num(state.open.length)}</b><small>ถูกเบิกอยู่</small></div></div>
-  <input data-bind="sq" placeholder="ค้นหารุ่น" value="${esc(state.sq)}" style="margin:0 0 12px">
+  const act = state.models.filter(m => m.active), tot = act.reduce((a, m) => a + m.stock, 0), reg = act.reduce((a, m) => a + regOf(m.id), 0);
+  return errBanner() + `<button class="primary big" data-act="rcvGo" style="margin:0 0 14px">📥 รับเข้าสต็อก (ยิง IMEI)</button>
+  <div class="stats"><div><b>${num(tot)}</b><small>คงเหลือทั้งหมด</small></div><div><b>${num(reg)}</b><small>ลง IMEI แล้ว</small></div><div><b>${num(state.open.length)}</b><small>ถูกเบิกอยู่</small></div></div>
+  <details class="card" style="padding:12px 14px" ${state.models.length ? '' : 'open'}><summary style="cursor:pointer;font-weight:700">＋ เพิ่มรุ่นใหม่</summary>
+    <div class="row" style="margin:10px 0 0"><label style="flex:2;margin:0">ชื่อรุ่น<input data-bind="newModel" value="${esc(state.newModel)}" placeholder="เช่น iPhone 15 128GB"></label>
+    <label style="margin:0">จำนวนตั้งต้น<input data-bind="newQty" type="number" inputmode="numeric" min="0" value="${esc(state.newQty)}" placeholder="0"></label></div>
+    <small style="margin-top:6px">ใส่ 0 แล้วค่อยกด “รับเข้า IMEI” ได้ · จำนวนตั้งต้นนับเป็นของเดิมที่ยังไม่ลง IMEI</small>
+    <button class="primary big" data-act="addModel">＋ เพิ่มรุ่น</button></details>
+  <input data-bind="sq" placeholder="🔍 ค้นหารุ่น" value="${esc(state.sq)}" style="margin:0 0 12px">
   <div id="stockList">${stockListHtml()}</div>`;
+}
+
+/* รับเข้าสต็อกด้วยการยิง IMEI */
+function addRcv(raw) {
+  const r = state.rcv, s = normImei(raw);
+  if (!r.model_id || !state.modelMap.get(r.model_id)) return '✗ เลือกรุ่นก่อนยิง';
+  if (!validImei(s)) return `✗ ${s} ไม่ใช่ IMEI ที่ถูกต้อง (15 หลัก)`;
+  if (r.items.includes(s)) return `✗ ยิง ${s} ซ้ำ`;
+  if (state.devMap.has(s)) return `✗ ${s} มีในสต็อกแล้ว (${mName(state.devMap.get(s))})`;
+  const loan = state.openMap.get(s); if (loan) return `✗ ${s} ถูกเบิกอยู่ (${loan.person}) — ต้องรับคืนก่อน`;
+  if (r.mode === 'register' && r.items.length >= unregOf(r.model_id)) return `✗ ของเดิมที่ยังไม่ลง IMEI ลงครบแล้ว (${unregOf(r.model_id)} เครื่อง)`;
+  r.items.push(s); renderRcv(); saveDraft();
+  return `✓ ${s} · ${mName(r.model_id)} (${r.items.length})`;
+}
+function rcvModelsHtml() {
+  const q = state.rcvQ.trim().toLowerCase(), ms = state.models.filter(m => m.active && (!q || m.name.toLowerCase().includes(q)));
+  return ms.length ? ms.map(m => `<button class="pbtn" data-act="rcvModel" data-id="${m.id}"><b>${esc(m.name)}</b><span>คงเหลือ <i>${num(m.stock)}</i>${unregOf(m.id) ? ` · <em>ไม่ลง IMEI ${unregOf(m.id)}</em>` : ''}</span></button>`).join('')
+    : '<p class="muted center" style="margin:4px 0">ไม่พบรุ่น — เพิ่มรุ่นที่หน้าสต็อก</p>';
+}
+function rcvTopHtml() {
+  const r = state.rcv, m = state.modelMap.get(r.model_id);
+  if (!m) return `${state.models.filter(x => x.active).length > 8 ? `<input data-bind="rcvQ" placeholder="🔍 ค้นหารุ่น" value="${esc(state.rcvQ)}" autocomplete="off" style="margin:0 0 8px">` : ''}<div class="plist" id="rcvModels">${rcvModelsHtml()}</div>`;
+  const un = unregOf(m.id);
+  if (r.mode === 'register' && !un) r.mode = 'new';
+  return `<div class="who"><div class="grow"><small>รุ่นที่รับเข้า</small><b>${esc(m.name)}</b><small>คงเหลือ ${num(m.stock)} · ลง IMEI แล้ว ${num(regOf(m.id))}${un ? ` · ยังไม่ลง ${num(un)}` : ''}</small></div><button data-act="rcvModel" data-id="">เปลี่ยนรุ่น</button></div>
+    <div class="seg" style="margin:12px 0 4px"><button data-act="rcvMode" data-m="new" class="${r.mode === 'new' ? 'on' : ''}">📦 รับเข้าใหม่</button><button data-act="rcvMode" data-m="register" class="${r.mode === 'register' ? 'on' : ''}" ${un ? '' : 'disabled'}>🏷️ ลง IMEI ของเดิม${un ? ` (${un})` : ''}</button></div>
+    <small>${r.mode === 'new' ? 'เครื่องเข้ามาใหม่ — สต็อกเพิ่มตามจำนวนที่ยิง' : 'เครื่องที่มีอยู่แล้วในสต็อกแต่ยังไม่มี IMEI — สต็อกไม่เปลี่ยน'}</small>`;
+}
+function rcvListHtml() {
+  const it = state.rcv.items;
+  return it.length ? `<div class="chips">${it.slice().reverse().map(x => `<span class="chip">${esc(x)}<button data-act="rcvDel" data-imei="${esc(x)}" aria-label="ลบ">✕</button></span>`).join('')}</div>` : '<p class="muted center" style="margin:6px 0">ยังไม่ได้ยิง IMEI</p>';
+}
+const rcvSumHtml = () => `<span>${state.rcv.model_id ? esc(mName(state.rcv.model_id)) : 'ยังไม่ได้เลือกรุ่น'}</span><b>${state.rcv.items.length} เครื่อง</b>`;
+function renderRcv(top) {
+  if (top) { const t = $('#rcvTop'); if (t) t.innerHTML = rcvTopHtml(); }
+  const l = $('#rcvList'); if (l) l.innerHTML = rcvListHtml();
+  const s = $('#rcvSum'); if (s) s.innerHTML = rcvSumHtml();
+}
+function viewReceive() {
+  return errBanner() + `<button class="ghost" data-view="stock" style="margin-bottom:8px">← กลับไปหน้าสต็อก</button>
+  <section class="card"><h2>รับเข้าสต็อกด้วย IMEI</h2><div id="rcvTop">${rcvTopHtml()}</div>
+    <label style="margin:12px 0 0">หมายเหตุ (เช่น เลขที่ใบส่งของ / ผู้ส่ง)<input data-bind="rcv.note" value="${esc(state.rcv.note)}"></label></section>
+  <section class="card"><h2>ยิง IMEI</h2>${scanBox('rcv')}<div id="rcvList" style="margin-top:12px">${rcvListHtml()}</div></section>
+  <div class="cta"><div class="sum" id="rcvSum">${rcvSumHtml()}</div><button class="primary big" data-act="rcvCommit">📥 บันทึกรับเข้า</button></div>`;
+}
+function imeiDlg(id) {
+  const m = state.modelMap.get(+id); if (!m) return;
+  const list = [...state.devMap].filter(([, mid]) => mid === m.id).map(([i]) => i).sort();
+  const q = state.imeiQ.trim().toUpperCase(), shown = list.filter(i => !q || i.includes(q));
+  showDialog(`<h2>IMEI ในสต็อก · ${esc(m.name)}</h2>
+    <p class="muted" style="margin-bottom:8px">ลง IMEI แล้ว <b>${list.length}</b> เครื่อง${unregOf(m.id) ? ` · ของเดิมยังไม่ลง ${unregOf(m.id)} เครื่อง` : ''}</p>
+    ${list.length > 10 ? `<input id="imeiFind" placeholder="🔍 ค้นหา IMEI" value="${esc(state.imeiQ)}" autocomplete="off" style="margin:0 0 8px">` : ''}
+    <div class="misslist" style="max-height:44vh;background:#fff;border-color:var(--line)">${shown.length ? shown.map(i => `<div class="mrow"><div class="grow"><b class="code">${esc(i)}</b></div><button class="danger" style="padding:4px 10px;font-size:13px" data-act="imeiRemove" data-imei="${esc(i)}" data-id="${m.id}">ตัดออก</button></div>`).join('') : '<p class="muted center" style="margin:6px 0">ยังไม่มี IMEI</p>'}</div>
+    <button class="primary big" data-act="rcvGo" data-id="${m.id}">📥 รับเข้า IMEI รุ่นนี้</button>
+    <button class="big" data-act="closeDlg">ปิด</button>`);
+  const f = $('#imeiFind'); if (f) { f.oninput = () => { state.imeiQ = f.value; const pos = f.selectionStart; imeiDlg(id); const g = $('#imeiFind'); g?.focus(); g?.setSelectionRange(pos, pos); }; }
 }
 
 /* ประวัติเอกสาร */
@@ -582,7 +678,7 @@ function historyListHtml() {
     return `<div class="card item doc t-${d.type}" data-act="viewDoc" data-no="${esc(d.doc_no)}"><div class="line" style="border:0;padding:0"><div class="grow">
       <span class="badge ${DOC_CLS[d.type]}">${DOC_T[d.type]}</span> <b class="code">${esc(d.doc_no)}</b>
       <small>${fmt(d.created_at)} · ${esc(d.person || '-')}${d.dept ? ' · ' + esc(d.dept) : ''}</small><small>${docSummary(d)}</small></div>${st}</div></div>`;
-  }).join('') : '<p class="muted center">ไม่มีรายการ</p>';
+  }).join('') : '<div class="empty"><i>🧾</i><b>ยังไม่มีเอกสาร</b></div>';
   return html + (state.docs.length >= state.docsLimit ? '<button data-act="moreDocs" style="width:100%">โหลดเพิ่ม</button>' : '');
 }
 const renderHistoryList = () => { const e = $('#histList'); if (e) e.innerHTML = historyListHtml(); };
@@ -690,10 +786,10 @@ function viewNews() {
   const list = isIssuer() ? state.anns : annShown();
   return errBanner() + `<div class="news-hero"><div><small>ประกาศ</small><b>เครื่องเข้าใหม่ &amp; ข่าวสาร</b></div><span>${annShown().length}</span></div>
     ${isIssuer() ? annFormHtml() : ''}
-    ${list.length ? list.map(annCardHtml).join('') : '<p class="muted center">ยังไม่มีประกาศ</p>'}`;
+    ${list.length ? list.map(annCardHtml).join('') : '<div class="empty"><i>📢</i><b>ยังไม่มีประกาศ</b><span>ประกาศเครื่องเข้าใหม่จะแสดงที่นี่</span></div>'}`;
 }
 
-const views = { news: viewNews, request: viewRequest, requests: viewRequests, fulfill: viewFulfill, return: viewReturn, out: viewOut, stock: viewStock, history: viewHistory, settings: viewSettings };
+const views = { receive: viewReceive, news: viewNews, request: viewRequest, requests: viewRequests, fulfill: viewFulfill, return: viewReturn, out: viewOut, stock: viewStock, history: viewHistory, settings: viewSettings };
 function render() {
   document.body.classList.toggle('noauth', !state.session);
   if (state.session) fixView();
@@ -713,6 +809,7 @@ function go(v) {
     else if (v === 'fulfill' && curReq()?.status === 'PENDING') { renderFul(); renderNav(); }
     else if (v === 'return') { refreshReturnInPlace(); renderNav(); }
     else if (v === 'news' && state.annEdit) renderNav();
+    else if (v === 'receive') { renderRcv(); renderNav(); } // ไม่วาดการ์ดรุ่นใหม่ทับ (กันแตะไม่ติด)
     else render();
   });
 }
@@ -722,6 +819,8 @@ const submitReq = () => guarded(async () => {
   const r = state.req, items = reqLines();
   if (!r.person.trim()) return toast('กรุณาระบุผู้เบิก', true);
   if (!items.length) return toast('ยังไม่ได้เลือกรุ่นและจำนวน', true);
+  const over = items.find(x => x.qty > availOf(x.model_id));
+  if (over) return toast(`${mName(over.model_id)} พร้อมเบิกเหลือ ${availOf(over.model_id)} เครื่อง`, true);
   const no = await rpc('req_create', { p_person: r.person, p_dept: r.dept, p_purpose: r.purpose, p_note: r.note, p_by: opName(), p_items: items });
   state.req = { person: isIssuer() ? '' : r.person, dept: isIssuer() ? '' : r.dept, purpose: '', note: '', qty: {} }; saveDraft();
   await refresh(); state.view = 'requests'; state.rq = 'PENDING'; render();
@@ -830,6 +929,7 @@ function stockDlg(id) {
   const m = state.modelMap.get(+id); if (!m) return;
   showDialog(`<h2>ปรับสต็อก · ${esc(m.name)}</h2>
     <p>คงเหลือปัจจุบัน <b class="bignum">${num(m.stock)}</b> เครื่อง</p>
+    <p class="hint">ใช้กับเครื่องที่<b>ยังไม่ลง IMEI</b> · เครื่องที่มี IMEI ให้รับเข้า/ตัดออกด้วยการยิง IMEI</p>
     <label>จำนวน<input id="adjQty" type="number" inputmode="numeric" min="0" placeholder="0"></label>
     <label>หมายเหตุ (เช่น รับเข้าจากซัพพลายเออร์, ตรวจนับประจำเดือน)<input id="adjNote"></label>
     <div class="row"><button class="primary" data-act="adjust" data-id="${m.id}" data-mode="add">＋ รับเข้า</button><button data-act="adjust" data-id="${m.id}" data-mode="sub">− ตัดออก</button></div>
@@ -1077,6 +1177,33 @@ const actions = {
   }),
   stockDlg: d => stockDlg(d.id),
   personDlg: d => personDlg(d.p),
+  rcvGo: d => { if (d.id && +d.id !== state.rcv.model_id) state.rcv = { model_id: +d.id, mode: 'new', items: [], note: '' }; saveDraft(); go('receive'); },
+  rcvModel: d => {
+    const id = d.id ? +d.id : null;
+    if (state.rcv.items.length && id !== state.rcv.model_id && !confirm(`ยิงไปแล้ว ${state.rcv.items.length} เครื่อง — เปลี่ยนรุ่นจะล้างรายการที่ยิงไว้`)) return;
+    if (id !== state.rcv.model_id) state.rcv.items = [];
+    state.rcv.model_id = id; state.rcv.mode = 'new'; saveDraft(); renderRcv(true);
+  },
+  rcvMode: d => {
+    if (d.m === 'register' && state.rcv.items.length > unregOf(state.rcv.model_id)) return toast(`ของเดิมที่ยังไม่ลง IMEI มี ${unregOf(state.rcv.model_id)} เครื่อง — ลบรายการที่ยิงเกินก่อน`, true);
+    state.rcv.mode = d.m; saveDraft(); renderRcv(true);
+  },
+  rcvDel: d => { state.rcv.items = state.rcv.items.filter(x => x !== d.imei); saveDraft(); renderRcv(); },
+  rcvCommit: () => guarded(async () => {
+    const r = state.rcv;
+    if (!r.model_id) return toast('เลือกรุ่นก่อน', true);
+    if (!r.items.length) return toast('ยังไม่ได้ยิง IMEI', true);
+    const n = r.items.length, name = mName(r.model_id);
+    const bal = await rpc('stock_receive', { p_model_id: r.model_id, p_imeis: r.items, p_mode: r.mode, p_note: r.note, p_by: opName() });
+    state.rcv.items = []; state.rcv.note = ''; saveDraft();
+    await refresh(); render(); toast(`${r.mode === 'new' ? 'รับเข้า' : 'ลง IMEI'} ${name} ${n} เครื่องแล้ว · คงเหลือ ${num(bal)}`);
+  }),
+  imeiDlg: d => { state.imeiQ = ''; imeiDlg(d.id); },
+  imeiRemove: d => {
+    const why = prompt(`ตัด ${d.imei} ออกจากสต็อก — ระบุเหตุผล (เช่น เครื่องเสีย / สูญหาย / ย้ายคลัง)`); if (why == null) return;
+    if (!why.trim()) return toast('กรุณาระบุเหตุผล', true);
+    guarded(async () => { await rpc('stock_remove', { p_imeis: [d.imei], p_note: why, p_by: opName() }); await refresh(); renderStockList(); imeiDlg(d.id); toast(`ตัด ${d.imei} ออกแล้ว`); });
+  },
   authTab: d => { state.authTab = d.t; render(); },
   annNew: () => { state.annEdit = 'new'; state.annKind = 'new'; render(); setTimeout(() => $('#anTitle')?.focus(), 50); },
   annEdit: d => { state.annEdit = +d.id; state.annKind = state.anns.find(a => a.id === +d.id)?.kind; render(); },
@@ -1202,6 +1329,7 @@ function onBind(e) {
   else if (b === 'hq' || b === 'ht') renderHistoryList();
   else if (b === 'pq') renderReqList();
   else if (b === 'sq') renderStockList();
+  else if (b === 'rcvQ') { const pl = $('#rcvModels'); if (pl) pl.innerHTML = rcvModelsHtml(); }
   else if (b === 'retQ') { const pl = $('#plist'); if (pl) pl.innerHTML = plistHtml(); }
   else if (b === 'retPerson') {
     if (state.cart.return.some(x => x.person !== v)) state.cart.return = state.cart.return.filter(x => x.person === v);
@@ -1209,13 +1337,13 @@ function onBind(e) {
   }
   else if (b === 'mq') { const p = $('#modelPick'); if (p) p.innerHTML = modelPickHtml(); }
   else if (b === 'operator') { try { localStorage.setItem('operator', v); } catch { } }
-  if (b.startsWith('req.') || b === 'rnote' || b === 'retPerson') saveDraft();
+  if (b.startsWith('req.') || b.startsWith('rcv.') || b === 'rnote' || b === 'retPerson') saveDraft();
 }
 document.addEventListener('input', onBind);
 document.addEventListener('change', onBind);
 let scanBuf = '', scanT = 0;
 document.addEventListener('keydown', e => {
-  const scanView = state.view === 'return' ? 'return' : state.view === 'fulfill' ? 'ful' : '';
+  const scanView = state.view === 'return' ? 'return' : state.view === 'fulfill' ? 'ful' : state.view === 'receive' ? 'rcv' : '';
   const t = e.target, typing = /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '') || t.isContentEditable;
   if (scanView && !typing && !document.querySelector('dialog[open]') && !e.ctrlKey && !e.metaKey && !e.altKey) {
     const now = Date.now(); if (now - scanT > 400) scanBuf = ''; scanT = now;
