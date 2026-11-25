@@ -200,7 +200,8 @@ insert into public.app_settings(key, value) values ('allow_signup', 'true') on c
 -- ค่าที่หน้าเข้าสู่ระบบต้องรู้ (เรียกได้โดยไม่ต้องล็อกอิน)
 create or replace function public.app_config()
 returns jsonb language sql stable security definer set search_path = public as $$
-  select jsonb_build_object('allow_signup', coalesce((select value from app_settings where key = 'allow_signup'), 'true'::jsonb))
+  select jsonb_build_object('allow_signup', coalesce((select value from app_settings where key = 'allow_signup'), 'true'::jsonb),
+                            'act_access', coalesce((select value #>> '{}' from app_settings where key = 'act_access'), 'all'))
 $$;
 
 create or replace function public.set_allow_signup(p_on boolean)
@@ -409,6 +410,63 @@ begin
   return v_n;
 end $$;
 
+-- แก้ IMEI ที่อยู่ในสต็อก (v2.9): เปลี่ยนเลข IMEI และ/หรือ ย้ายรุ่น — ย้ายรุ่นแล้วจำนวนสต็อกย้ายตาม
+create or replace function public.dev_edit(p_imei text, p_new_imei text, p_model_id bigint, p_by text)
+returns void language plpgsql security definer set search_path = public as $$
+declare d devices%rowtype; v_new text := upper(trim(coalesce(p_new_imei, ''))); v_bal int; v_av int; v_by text := coalesce(trim(p_by), '');
+        v_old text; v_new_m text;
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  select * into d from devices where imei = upper(trim(p_imei)) for update;
+  if not found or d.status <> 'IN_STOCK' then raise exception 'IMEI % ไม่อยู่ในสต็อก', p_imei; end if;
+  if v_new = '' then v_new := d.imei; end if;
+  if v_new !~ '^[A-Z0-9-]{5,30}$' then raise exception 'IMEI ใหม่ไม่ถูกต้อง'; end if;
+  if p_model_id is null or not exists (select 1 from models where id = p_model_id) then raise exception 'ไม่พบรุ่นที่เลือก'; end if;
+  if v_new = d.imei and p_model_id = d.model_id then return; end if;
+  if v_new <> d.imei then
+    if exists (select 1 from devices where imei = v_new and status = 'IN_STOCK') then raise exception 'IMEI % มีในสต็อกอยู่แล้ว', v_new; end if;
+    if exists (select 1 from loans where imei = v_new and returned_at is null) then raise exception 'IMEI % ถูกเบิกอยู่', v_new; end if;
+    delete from devices where imei = v_new;   -- เลขเดิมที่เคยขาย/ตัดออกไปแล้ว
+  end if;
+  if p_model_id <> d.model_id then
+    select avail into v_av from model_avail() where model_id = d.model_id;
+    if coalesce(v_av, 0) < 1 then raise exception 'ย้ายรุ่นไม่ได้: รุ่นเดิมถูกจองในคำขอเบิกหมดแล้ว'; end if;
+    select name into v_old from models where id = d.model_id; select name into v_new_m from models where id = p_model_id;
+    update models set stock = stock - 1 where id = d.model_id returning stock into v_bal;
+    insert into stock_moves(model_id, delta, balance, reason, note, by_name) values (d.model_id, -1, v_bal, 'OUT', 'แก้รุ่น IMEI ' || v_new || ' → ' || v_new_m, v_by);
+    update models set stock = stock + 1 where id = p_model_id returning stock into v_bal;
+    insert into stock_moves(model_id, delta, balance, reason, note, by_name) values (p_model_id, 1, v_bal, 'IN', 'แก้รุ่น IMEI ' || v_new || ' จาก ' || v_old, v_by);
+  end if;
+  update devices set imei = v_new, model_id = p_model_id, updated_at = now(),
+    note = case when v_new <> d.imei then trim(both ' ' from note || ' (แก้จาก ' || d.imei || ')') else note end
+  where imei = d.imei;
+end $$;
+
+-- ลบ IMEI ที่ลงผิด (ลบทิ้ง ลงใหม่ได้) — p_keep_qty = true: จำนวนสต็อกคงเดิม (กลับเป็น “ยังไม่ลง IMEI”) · false: ลดจำนวนสต็อกด้วย
+create or replace function public.dev_delete(p_imeis text[], p_keep_qty boolean, p_by text)
+returns int language plpgsql security definer set search_path = public as $$
+declare v_list text[]; v_bad text; rec record; v_bal int; v_av int; v_n int := 0; v_by text := coalesce(trim(p_by), '');
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_list from unnest(coalesce(p_imeis, '{}')) x where trim(x) <> '';
+  if cardinality(v_list) = 0 then raise exception 'ยังไม่ได้เลือก IMEI'; end if;
+  select string_agg(x, ', ') into v_bad from unnest(v_list) x
+  where not exists (select 1 from devices d where d.imei = x and d.status = 'IN_STOCK');
+  if v_bad is not null then raise exception 'ไม่อยู่ในสต็อก: %', v_bad; end if;
+  for rec in select d.model_id, m.name, count(*)::int c from devices d join models m on m.id = d.model_id where d.imei = any(v_list) group by d.model_id, m.name loop
+    if not coalesce(p_keep_qty, false) then
+      select avail into v_av from model_avail() where model_id = rec.model_id;
+      if coalesce(v_av, 0) < rec.c then raise exception 'รุ่น % พร้อมเบิกเหลือ % เครื่อง (ที่เหลือถูกจองในคำขอ) — ลดจำนวน % เครื่องไม่ได้ ให้เลือก “จำนวนคงเดิม” แทน', rec.name, greatest(v_av, 0), rec.c; end if;
+      update models set stock = stock - rec.c where id = rec.model_id returning stock into v_bal;
+      insert into stock_moves(model_id, delta, balance, reason, note, by_name)
+      values (rec.model_id, -rec.c, v_bal, 'OUT', 'ลบ IMEI ที่ลงผิด ' || rec.c || ' เครื่อง', v_by);
+    end if;
+    v_n := v_n + rec.c;
+  end loop;
+  delete from devices where imei = any(v_list);
+  return v_n;
+end $$;
+
 -- ───────── Activate เครื่อง (v2.7) — ทุกคนบันทึกได้ · กรอกแล้วถือว่า Activated ─────────
 create table if not exists public.activations (
   id           bigint generated always as identity primary key,
@@ -440,12 +498,29 @@ returns jsonb language sql stable security definer set search_path = public as $
   left join activations a on a.imei = q.imei
 $$;
 
-create or replace function public.act_add(p_imei text, p_model_id bigint, p_model text, p_color text, p_note text, p_by text)
+-- สิทธิ์ดู/บันทึก Activate ของผู้เบิก: all = เห็นทั้งหมด · own = เห็นเฉพาะที่ตัวเองบันทึก · issuer = เฉพาะผู้จ่ายเบิก
+create or replace function public.act_access()
+returns text language sql stable security definer set search_path = public as $$
+  select coalesce((select value #>> '{}' from app_settings where key = 'act_access'), 'all')
+$$;
+create or replace function public.act_set_access(p_mode text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  if p_mode not in ('all','own','issuer') then raise exception 'ค่าสิทธิ์ไม่ถูกต้อง'; end if;
+  insert into app_settings(key, value) values ('act_access', to_jsonb(p_mode)) on conflict (key) do update set value = excluded.value;
+end $$;
+
+-- p_at = วันเวลา Activate (ไม่ใส่ = ตอนนี้) — ใช้ลงข้อมูลย้อนหลัง
+drop function if exists public.act_add(text,bigint,text,text,text,text);
+create or replace function public.act_add(p_imei text, p_model_id bigint, p_model text, p_color text, p_note text, p_by text, p_at timestamptz default null)
 returns bigint language plpgsql security definer set search_path = public as $$
 declare v_imei text := upper(trim(coalesce(p_imei, ''))); v_model text := trim(coalesce(p_model, '')); v_id bigint; a activations%rowtype;
 begin
   if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
+  if act_access() = 'issuer' and not is_issuer() then raise exception 'การ Activate เปิดให้เฉพาะผู้จ่ายเบิก'; end if;
   if v_imei !~ '^[A-Z0-9-]{5,30}$' then raise exception 'IMEI ไม่ถูกต้อง'; end if;
+  if p_at is not null and p_at > now() + interval '10 minutes' then raise exception 'วันที่ Activate อยู่ในอนาคตไม่ได้'; end if;
   select * into a from activations where imei = v_imei;
   if found then
     raise exception 'IMEI % Activate ไปแล้วเมื่อ % โดย %', v_imei,
@@ -454,10 +529,76 @@ begin
   if p_model_id is not null then select name into v_model from models where id = p_model_id; end if;
   if coalesce(v_model, '') = '' then raise exception 'กรุณาระบุรุ่น'; end if;
   if coalesce(trim(p_color), '') = '' then raise exception 'กรุณาระบุสี'; end if;
-  insert into activations(imei, model_id, model, color, note, by_name)
-  values (v_imei, p_model_id, v_model, trim(p_color), coalesce(trim(p_note), ''), coalesce(trim(p_by), ''))
+  insert into activations(imei, model_id, model, color, note, by_name, activated_at)
+  values (v_imei, p_model_id, v_model, trim(p_color), coalesce(trim(p_note), ''), coalesce(trim(p_by), ''), coalesce(p_at, now()))
   returning id into v_id;
   return v_id;
+end $$;
+
+-- แก้ไขรายการ (วันที่ / รุ่น / สี / หมายเหตุ): ผู้จ่ายเบิก หรือคนที่บันทึกเอง
+create or replace function public.act_update(p_id bigint, p_model_id bigint, p_model text, p_color text, p_note text, p_at timestamptz)
+returns void language plpgsql security definer set search_path = public as $$
+declare a activations%rowtype; v_model text := trim(coalesce(p_model, ''));
+begin
+  select * into a from activations where id = p_id for update;
+  if not found then raise exception 'ไม่พบรายการ'; end if;
+  if not (is_issuer() or (a.created_by = auth.uid() and act_access() <> 'issuer')) then raise exception 'แก้ได้เฉพาะผู้จ่ายเบิก หรือคนที่บันทึกเอง'; end if;
+  if p_at is null then raise exception 'กรุณาระบุวันที่'; end if;
+  if p_at > now() + interval '10 minutes' then raise exception 'วันที่ Activate อยู่ในอนาคตไม่ได้'; end if;
+  if p_model_id is not null then select name into v_model from models where id = p_model_id; end if;
+  if coalesce(v_model, '') = '' then raise exception 'กรุณาระบุรุ่น'; end if;
+  if coalesce(trim(p_color), '') = '' then raise exception 'กรุณาระบุสี'; end if;
+  update activations set model_id = p_model_id, model = v_model, color = trim(p_color), note = coalesce(trim(p_note), ''), activated_at = p_at
+  where id = p_id;
+end $$;
+
+-- ลบหลายรายการพร้อมกัน: ผู้จ่ายเบิกลบได้ทุกรายการ · ผู้เบิกลบได้เฉพาะที่ตัวเองบันทึก
+create or replace function public.act_delete_many(p_ids bigint[])
+returns int language plpgsql security definer set search_path = public as $$
+declare v_n int;
+begin
+  if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
+  if cardinality(coalesce(p_ids, '{}')) = 0 then raise exception 'ยังไม่ได้เลือกรายการ'; end if;
+  if not is_issuer() and (act_access() = 'issuer' or exists (select 1 from activations where id = any(p_ids) and created_by is distinct from auth.uid())) then
+    raise exception 'ลบได้เฉพาะรายการที่คุณบันทึกเอง';
+  end if;
+  delete from activations where id = any(p_ids);
+  get diagnostics v_n = row_count;
+  return v_n;
+end $$;
+
+-- ลิงก์ลับดูตาราง Activate โดยไม่ต้องล็อกอิน (ดูอย่างเดียว) — สร้างใหม่แล้วลิงก์เก่าใช้ไม่ได้
+create or replace function public.act_share_get()
+returns jsonb language plpgsql security definer set search_path = public as $$
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  return coalesce((select value from app_settings where key = 'act_share'), '{"on":false,"token":""}'::jsonb);
+end $$;
+create or replace function public.act_share_set(p_on boolean, p_new boolean)
+returns jsonb language plpgsql security definer set search_path = public, extensions as $$
+declare cur jsonb := coalesce((select value from app_settings where key = 'act_share'), '{"on":false,"token":""}'::jsonb); v_tok text;
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  v_tok := cur->>'token';
+  if coalesce(p_new, false) or coalesce(v_tok, '') = '' then
+    v_tok := translate(encode(gen_random_bytes(18), 'base64'), '+/=', '-_');
+  end if;
+  cur := jsonb_build_object('on', coalesce(p_on, false), 'token', v_tok);
+  insert into app_settings(key, value) values ('act_share', cur) on conflict (key) do update set value = excluded.value;
+  return cur;
+end $$;
+-- ใครก็เรียกได้ (ไม่ต้องล็อกอิน) แต่ต้องมีรหัสลิงก์ที่ถูกต้องและเปิดใช้งานอยู่
+create or replace function public.act_public(p_token text)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare cur jsonb := (select value from app_settings where key = 'act_share');
+begin
+  if cur is null or not coalesce((cur->>'on')::boolean, false) or coalesce(cur->>'token', '') = ''
+     or length(coalesce(p_token, '')) < 16 or p_token <> cur->>'token' then
+    return jsonb_build_object('ok', false);
+  end if;
+  return jsonb_build_object('ok', true, 'at', now(), 'items', coalesce((
+    select jsonb_agg(jsonb_build_object('imei', imei, 'model', model, 'color', color, 'activated_at', activated_at, 'status', status)
+                     order by activated_at desc, id desc) from activations), '[]'::jsonb));
 end $$;
 
 -- ลบรายการ (บันทึกผิด): ผู้จ่ายเบิก หรือคนที่บันทึกเอง
@@ -467,7 +608,7 @@ declare a activations%rowtype;
 begin
   select * into a from activations where id = p_id;
   if not found then raise exception 'ไม่พบรายการ'; end if;
-  if not (is_issuer() or a.created_by = auth.uid()) then raise exception 'ลบได้เฉพาะผู้จ่ายเบิก หรือคนที่บันทึกเอง'; end if;
+  if not (is_issuer() or (a.created_by = auth.uid() and act_access() <> 'issuer')) then raise exception 'ลบได้เฉพาะผู้จ่ายเบิก หรือคนที่บันทึกเอง'; end if;
   delete from activations where id = p_id;
 end $$;
 
@@ -796,7 +937,8 @@ create policy "read announcements" on public.announcements for select to authent
   using (is_issuer() or (active and (show_until is null or show_until >= (now() at time zone 'Asia/Bangkok')::date)));
 create policy "read stock_moves" on public.stock_moves for select to authenticated using (is_issuer());
 create policy "read devices" on public.devices for select to authenticated using (is_issuer());
-create policy "read activations" on public.activations for select to authenticated using (true);
+create policy "read activations" on public.activations for select to authenticated
+  using (is_issuer() or act_access() = 'all' or (act_access() = 'own' and created_by = auth.uid()));
 create policy "read requests" on public.requests for select to authenticated
   using (created_by = auth.uid() or is_issuer());
 create policy "read request_items" on public.request_items for select to authenticated
@@ -854,10 +996,28 @@ grant execute on function public.stock_remove(text[],text,text)                t
 revoke all on public.activations from anon, authenticated;
 grant select on public.activations to authenticated;
 revoke all on function public.imei_info(text)                                  from public, anon;
-revoke all on function public.act_add(text,bigint,text,text,text,text)         from public, anon;
+revoke all on function public.act_add(text,bigint,text,text,text,text,timestamptz) from public, anon;
+revoke all on function public.act_update(bigint,bigint,text,text,text,timestamptz) from public, anon;
+revoke all on function public.act_access()                                     from public, anon;
+revoke all on function public.act_set_access(text)                             from public, anon;
+revoke all on function public.act_share_get()                                  from public, anon;
+revoke all on function public.act_share_set(boolean,boolean)                   from public, anon;
+revoke all on function public.act_public(text)                                 from public;
+revoke all on function public.act_delete_many(bigint[])                        from public, anon;
+revoke all on function public.dev_edit(text,text,bigint,text)                  from public, anon;
+revoke all on function public.dev_delete(text[],boolean,text)                  from public, anon;
 revoke all on function public.act_delete(bigint)                               from public, anon;
 grant execute on function public.imei_info(text)                               to authenticated;
-grant execute on function public.act_add(text,bigint,text,text,text,text)      to authenticated;
+grant execute on function public.act_add(text,bigint,text,text,text,text,timestamptz) to authenticated;
+grant execute on function public.act_update(bigint,bigint,text,text,text,timestamptz) to authenticated;
+grant execute on function public.act_access()                                  to authenticated;
+grant execute on function public.act_set_access(text)                          to authenticated;
+grant execute on function public.act_share_get()                               to authenticated;
+grant execute on function public.act_share_set(boolean,boolean)                to authenticated;
+grant execute on function public.act_public(text)                              to anon, authenticated;
+grant execute on function public.act_delete_many(bigint[])                     to authenticated;
+grant execute on function public.dev_edit(text,text,bigint,text)               to authenticated;
+grant execute on function public.dev_delete(text[],boolean,text)               to authenticated;
 grant execute on function public.act_delete(bigint)                            to authenticated;
 revoke all on function public.ann_save(bigint,text,text,text,date,date,boolean,boolean,text) from public, anon;
 revoke all on function public.ann_delete(bigint)                                             from public, anon;

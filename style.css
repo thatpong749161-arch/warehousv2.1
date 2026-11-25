@@ -385,3 +385,28 @@ button,[data-act],[data-view]{touch-action:manipulation;-webkit-user-select:none
 .act-tr .imei-box{display:flex;flex-direction:column;min-width:0}
 .act-tr .imei{font-size:14px;overflow:visible;white-space:nowrap}
 .act-tr .clr{font-size:12px;color:var(--mut)}
+
+/* ===== v2.8: Activate — ย้อนหลัง / สิทธิ์ / ลิงก์แชร์ ===== */
+.act-info.warn{background:#fff1c2;color:#6b5100;border:1px solid #f2d16b}
+.act-admin summary{padding:2px 0}
+.seg3 button{font-size:12.5px;padding:8px 4px;line-height:1.3}
+.share-box{display:flex;gap:6px;margin-top:10px}
+.share-box input{margin:0;flex:1;font:500 12.5px var(--mono);background:#f6f8f9}
+.share-box button{flex:none}
+body.public .iconbtn,body.public #ticker{display:none!important}
+.pub-ref{background:var(--yel)!important;border:0!important;font-size:20px;padding:8px 12px;position:relative;z-index:1}
+
+/* ===== v2.9: ลบ/แก้ไข ===== */
+.act-tr{grid-template-columns:18px minmax(0,1fr) auto auto}
+.act-btns{display:flex;gap:2px}
+.act-btns button{padding:4px 8px;font-size:14px}
+.act-btns .del{color:var(--red,#c0392b)}
+.act-tr.selmode{cursor:pointer}
+.act-tr.selmode input,.imck input{width:18px;height:18px;margin:0;accent-color:var(--ink)}
+.act-tr.picked,.mrow.picked{background:#fff1c2!important}
+.selbtn{width:100%;margin:0 0 8px;font-size:13.5px;border:1px dashed var(--line)!important}
+.selbar{position:sticky;top:0;z-index:5;display:flex;gap:6px;align-items:center;flex-wrap:wrap;background:var(--ink,#1d2329);color:#fff;padding:8px;border-radius:8px;margin:0 0 8px}
+.selbar b{flex:1;font-size:14px;white-space:nowrap}
+.selbar button{padding:7px 10px;font-size:13px}
+.selbar button:disabled{opacity:.45}
+.imck{display:flex;gap:10px;align-items:center;cursor:pointer;margin:0}

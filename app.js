@@ -14,7 +14,7 @@ const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
 const MOVE_T = { REG: 'ลง IMEI ของเดิม', SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '2.7.1';
+const APP_VER = '2.9.0';
 // เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
 const ID_DOMAIN = 'loan.local';
 const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
@@ -31,7 +31,7 @@ const sb = configured ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPAB
 const state = {
   view: '', session: null, role: 'requester', me: { name: '', dept: '', username: '' }, authTab: 'login', signupOpen: true, operator: '', busy: false, loadErr: '',
   models: [], modelMap: new Map(), reqs: [], reqLimit: 200, anns: [], annEdit: null,
-  acts: [], actQ: '', actM: '', act: { imei: '', model_id: null, model: '', color: '', note: '', info: '', auto: false },
+  acts: [], actQ: '', actM: '', actAccess: 'all', actShare: null, actAt: '', pub: null, actSel: null, imeiSel: new Set(), devDel: null, act: { imei: '', model_id: null, model: '', color: '', note: '', info: '', auto: false },
   avail: new Map(), devMap: new Map(), tpl: {}, tplNew: [], imp: null, impMode: 'new', impCreate: true, rcv: { model_id: null, mode: 'new', items: [], note: '' }, rcvQ: '', imeiQ: '',
   open: [], openMap: new Map(), docs: [], docsLimit: 300,
   req: { person: '', dept: '', purpose: '', note: '', qty: {} },
@@ -57,14 +57,16 @@ const NAV = {
   issuer: [['requests', 'คำขอ', 'list'], ['return', 'รับคืน', 'ret'], ['out', 'ค้างอยู่', 'dev'], ['stock', 'สต็อก', 'box'], ['act', 'Activate', 'act'], ['news', 'ประกาศ', 'news'], ['history', 'ประวัติ', 'hist']]
 };
 const EXTRA = { requester: ['settings'], issuer: ['request', 'fulfill', 'receive', 'import', 'settings'] };
-const allowed = v => NAV[state.role].some(x => x[0] === v) || EXTRA[state.role].includes(v);
-const fixView = () => { if (!allowed(state.view)) state.view = NAV[state.role][0][0]; };
+// ผู้เบิกไม่เห็นเมนู Activate ถ้าตั้งสิทธิ์เป็น “เฉพาะผู้จ่ายเบิก”
+const navList = () => NAV[state.role].filter(([v]) => !(v === 'act' && state.role === 'requester' && state.actAccess === 'issuer'));
+const allowed = v => navList().some(x => x[0] === v) || EXTRA[state.role].includes(v);
+const fixView = () => { if (!allowed(state.view)) state.view = navList()[0][0]; };
 
 function renderNav() {
   const pend = state.reqs.filter(r => r.status === 'PENDING').length;
   const badge = { requests: pend, out: state.open.length, news: annUnseen() };
   const on = v => state.view === v || (v === 'requests' && state.view === 'fulfill') || (v === 'stock' && /^(receive|import)$/.test(state.view));
-  $('#nav').innerHTML = state.session ? NAV[state.role].map(([v, t, i]) => `<button data-view="${v}" class="${on(v) ? 'on' : ''}" data-n="${badge[v] || ''}"><svg viewBox="0 0 24 24">${IC[i]}</svg><span>${t}</span></button>`).join('') : '';
+  $('#nav').innerHTML = state.session ? navList().map(([v, t, i]) => `<button data-view="${v}" class="${on(v) ? 'on' : ''}" data-n="${badge[v] || ''}"><svg viewBox="0 0 24 24">${IC[i]}</svg><span>${t}</span></button>`).join('') : '';
   renderTicker();
   const rb = $('#role'); if (rb) { rb.hidden = !state.session; rb.textContent = ROLE_T[state.role]; rb.className = 'badge' + (isIssuer() ? ' warn' : ''); }
 }
@@ -258,7 +260,7 @@ async function fetchAll(build) {
   return out;
 }
 async function loadAppConfig() {
-  try { const { data } = await sb.rpc('app_config'); if (data) state.signupOpen = data.allow_signup !== false; } catch { }
+  try { const { data } = await sb.rpc('app_config'); if (data) { state.signupOpen = data.allow_signup !== false; state.actAccess = data.act_access || 'all'; } } catch { }
 }
 async function loadRole() {
   const { data, error } = await sb.from('profiles').select('role,name,dept,username').eq('user_id', state.session.user.id).maybeSingle();
@@ -781,6 +783,27 @@ function viewReceive() {
   <section class="card"><h2>ยิง IMEI</h2>${scanBox('rcv')}<div id="rcvList" style="margin-top:12px">${rcvListHtml()}</div></section>
   <div class="cta"><div class="sum" id="rcvSum">${rcvSumHtml()}</div><button class="primary big" data-act="rcvCommit">📥 บันทึกรับเข้า</button></div>`;
 }
+const imeiSelBarHtml = id => state.imeiSel.size ? `<div class="selbar" style="margin-top:8px"><b>เลือก ${state.imeiSel.size}</b><button class="danger" data-act="devDelSel" data-id="${id}">🗑 ลบที่เลือก</button><button data-act="imeiSelClear" data-id="${id}">ล้าง</button></div>` : '<p class="hint" style="margin:6px 0 0">ติ๊กเลือกเพื่อลบหลายเครื่อง · กด ✎ เพื่อแก้เลข IMEI / ย้ายรุ่น</p>';
+function devEditDlg(imei, id) {
+  const m = state.modelMap.get(+id);
+  showDialog(`<h2>แก้ไข IMEI ในสต็อก</h2><p class="muted" style="margin-bottom:10px">เดิม: <b class="code">${esc(imei)}</b> · ${esc(m?.name || '')}</p>
+    <label>เลข IMEI<input id="deImei" value="${esc(imei)}" inputmode="numeric" autocomplete="off" class="code"></label>
+    <label>รุ่น<select id="deModel">${state.models.filter(x => x.active || x.id === +id).map(x => `<option value="${x.id}" ${x.id === +id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
+    <p class="hint" style="margin-top:-4px">ย้ายรุ่นแล้ว จำนวนสต็อกจะย้ายจากรุ่นเดิมไปรุ่นใหม่ 1 เครื่อง</p>
+    <button class="primary big" data-act="devEditSave" data-imei="${esc(imei)}" data-id="${id}" style="margin-top:0">บันทึก</button>
+    <div class="row" style="margin:10px 0 0"><button class="danger" data-act="devDelOne" data-imei="${esc(imei)}" data-id="${id}">🗑 ลบ (ลงผิด)</button><button data-act="imeiRemove" data-imei="${esc(imei)}" data-id="${id}">📤 ตัดออก (เสีย/หาย)</button></div>
+    <button class="big ghost" data-act="imeiBack" data-id="${id}">← กลับ</button>`);
+}
+function devDelDlg(imeis, id) {
+  if (!imeis.length) return;
+  state.devDel = imeis;
+  showDialog(`<h2>ลบ IMEI ที่ลงผิด ${imeis.length} เครื่อง</h2>
+    <div class="misslist" style="max-height:24vh;background:#fff;border-color:var(--line);margin-bottom:10px">${imeis.map(i => `<div class="mrow"><b class="code">${esc(i)}</b></div>`).join('')}</div>
+    <p class="hint">เลือกว่าจะทำอย่างไรกับ <b>จำนวนสต็อก</b>:</p>
+    <button class="danger big" data-act="devDelGo" data-keep="0" data-id="${id}" style="margin-top:4px">ลบ + ลดจำนวนสต็อก<br><small style="font-weight:400">ไม่มีเครื่องนี้จริง (รับเข้าผิด / ยิงซ้ำ)</small></button>
+    <button class="big" data-act="devDelGo" data-keep="1" data-id="${id}">ลบเฉพาะเลข · จำนวนคงเดิม<br><small style="font-weight:400">มีเครื่องจริงแต่ยิงเลขผิด — ลงเลขที่ถูกใหม่ทีหลัง</small></button>
+    <button class="big ghost" data-act="imeiBack" data-id="${id}">ยกเลิก</button>`);
+}
 function imeiDlg(id) {
   const m = state.modelMap.get(+id); if (!m) return;
   const list = [...state.devMap].filter(([, mid]) => mid === m.id).map(([i]) => i).sort();
@@ -788,7 +811,8 @@ function imeiDlg(id) {
   showDialog(`<h2>IMEI ในสต็อก · ${esc(m.name)}</h2>
     <p class="muted" style="margin-bottom:8px">ลง IMEI แล้ว <b>${list.length}</b> เครื่อง${unregOf(m.id) ? ` · ของเดิมยังไม่ลง ${unregOf(m.id)} เครื่อง` : ''}</p>
     ${list.length > 10 ? `<input id="imeiFind" placeholder="🔍 ค้นหา IMEI" value="${esc(state.imeiQ)}" autocomplete="off" style="margin:0 0 8px">` : ''}
-    <div class="misslist" style="max-height:44vh;background:#fff;border-color:var(--line)">${shown.length ? shown.map(i => `<div class="mrow"><div class="grow"><b class="code">${esc(i)}</b></div><button class="danger" style="padding:4px 10px;font-size:13px" data-act="imeiRemove" data-imei="${esc(i)}" data-id="${m.id}">ตัดออก</button></div>`).join('') : '<p class="muted center" style="margin:6px 0">ยังไม่มี IMEI</p>'}</div>
+    <div class="misslist" style="max-height:44vh;background:#fff;border-color:var(--line)">${shown.length ? shown.map(i => `<div class="mrow imrow${state.imeiSel.has(i) ? ' picked' : ''}"><label class="grow imck"><input type="checkbox" class="imeick" data-imei="${esc(i)}" data-id="${m.id}" ${state.imeiSel.has(i) ? 'checked' : ''}><b class="code">${esc(i)}</b></label><button class="ghost" style="padding:4px 12px;font-size:15px" data-act="devEdit" data-imei="${esc(i)}" data-id="${m.id}" aria-label="แก้ไข">✎</button></div>`).join('') : '<p class="muted center" style="margin:6px 0">ยังไม่มี IMEI</p>'}</div>
+    <div id="imeiSelBar">${imeiSelBarHtml(m.id)}</div>
     <button class="primary big" data-act="rcvGo" data-id="${m.id}">📥 รับเข้า IMEI รุ่นนี้</button>
     <button class="big" data-act="closeDlg">ปิด</button>`);
   const f = $('#imeiFind'); if (f) { f.oninput = () => { state.imeiQ = f.value; const pos = f.selectionStart; imeiDlg(id); const g = $('#imeiFind'); g?.focus(); g?.setSelectionRange(pos, pos); }; }
@@ -908,7 +932,19 @@ async function readImportFile(file) {
 
 /* ---------- Activate ---------- */
 const actMine = a => a.created_by === state.session?.user?.id;
+const canEditAct = a => !state.pub && (isIssuer() || (actMine(a) && state.actAccess !== 'issuer'));
+function actEditDlg(id) {
+  const a = state.acts.find(x => x.id === +id); if (!a) return;
+  showDialog(`<h2>แก้ไข Activate</h2><p class="code" style="font-size:15px;margin-bottom:10px">${esc(a.imei)}</p>
+    <label>วันเวลา Activate<input id="aeAt" type="datetime-local" value="${toLocalDT(a.activated_at)}" max="${toLocalDT(new Date())}"></label>
+    <label>รุ่น<input id="aeModel" list="actModels2" value="${esc(a.model)}"></label><datalist id="actModels2">${state.models.map(m => `<option value="${esc(m.name)}">`).join('')}</datalist>
+    <label>สี<input id="aeColor" value="${esc(a.color)}"></label>
+    <label>หมายเหตุ<input id="aeNote" value="${esc(a.note || '')}"></label>
+    <button class="primary big" data-act="actEditSave" data-id="${a.id}" style="margin-top:0">บันทึก</button>
+    <div class="row" style="margin:10px 0 0"><button class="danger" data-act="actDel" data-id="${a.id}" data-imei="${esc(a.imei)}">🗑 ลบรายการนี้</button><button data-act="closeDlg">ยกเลิก</button></div>`);
+}
 const recentColors = () => [...new Set(state.acts.map(a => a.color).filter(Boolean))].slice(0, 8);
+const toLocalDT = d => { const x = new Date(d); x.setMinutes(x.getMinutes() - x.getTimezoneOffset()); return x.toISOString().slice(0, 16); };
 function actFormHtml() {
   const f = state.act, colors = recentColors();
   return `<label>IMEI * <small style="display:inline">(ยิงบาร์โค้ด / พิมพ์แล้วกด Enter)</small>
@@ -920,6 +956,9 @@ function actFormHtml() {
     <label>สี *<input id="actColor" list="actColors" value="${esc(f.color)}" placeholder="เช่น ดำ / ขาว / Titanium Blue" autocomplete="off"></label>
     <datalist id="actColors">${colors.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
     ${colors.length ? `<div class="chips" style="margin:-4px 0 12px">${colors.map(c => `<button class="rchip" data-act="actColor" data-v="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : ''}
+    <label>วันเวลา Activate <small style="display:inline">(เว้นว่าง = ตอนนี้ · ใส่เพื่อลงข้อมูลย้อนหลัง)</small>
+      <div class="row" style="margin:4px 0 0;flex-wrap:nowrap"><input id="actAt" type="datetime-local" value="${esc(state.actAt)}" max="${toLocalDT(new Date())}" style="margin:0;flex:1"><button data-act="actAtClear" style="flex:0 0 auto">ตอนนี้</button></div></label>
+    ${state.actAt ? `<p class="act-info warn">📅 กำลังลงย้อนหลัง: ${esc(new Date(state.actAt).toLocaleString('th-TH', { dateStyle: 'medium', timeStyle: 'short' }))} — ทุกเครื่องที่บันทึกจะใช้วันนี้ จนกว่าจะกด “ตอนนี้”</p>` : ''}
     <label>หมายเหตุ<input id="actNote" value="${esc(f.note)}" placeholder="ไม่บังคับ"></label>
     <label class="chk" style="margin-bottom:12px"><input type="checkbox" id="actAuto" ${f.auto ? 'checked' : ''}> ยิงแล้วบันทึกทันที (ใช้รุ่นที่ระบบหาเจอ + สีที่กรอกไว้) — เหมาะกับ Activate หลายเครื่องสีเดียวกัน</label>
     <button class="primary big" data-act="actSave" style="margin-top:0">✅ บันทึก Activate</button>`;
@@ -928,9 +967,9 @@ function actFormHtml() {
 function actSummaryHtml() {
   const today = todayISO(), cnt = new Map();
   state.acts.forEach(a => { const g = cnt.get(a.model) || { n: 0, t: 0 }; g.n++; if (new Date(a.activated_at).toLocaleDateString('sv-SE') === today) g.t++; cnt.set(a.model, g); });
-  state.models.filter(m => m.active).forEach(m => { if (!cnt.has(m.name)) cnt.set(m.name, { n: 0, t: 0 }); });
+  if (!state.pub) state.models.filter(m => m.active).forEach(m => { if (!cnt.has(m.name)) cnt.set(m.name, { n: 0, t: 0 }); });
   const rows = [...cnt].sort((a, b) => a[0].localeCompare(b[0], 'th'));
-  if (!rows.length) return '<p class="muted center" style="margin:0">ยังไม่มีรุ่น</p>';
+  if (!rows.length) return '<p class="muted center" style="margin:0">ยังไม่มีรายการ</p>';
   return `<table class="sum-t"><thead><tr><th>รุ่น</th><th class="r">Activated</th><th class="r">วันนี้</th></tr></thead><tbody>
     <tr class="${state.actM ? '' : 'sel'}" data-act="actPick" data-m=""><td><b>ทุกรุ่น</b></td><td class="r"><b>${num(state.acts.length)}</b></td><td class="r">${num(rows.reduce((a, [, g]) => a + g.t, 0))}</td></tr>
     ${rows.map(([m, g]) => `<tr class="${state.actM === m ? 'sel' : ''} ${g.n ? '' : 'zero'}" data-act="actPick" data-m="${esc(m)}"><td>${esc(m)}</td><td class="r">${num(g.n)}</td><td class="r">${g.t ? num(g.t) : '–'}</td></tr>`).join('')}</tbody></table>`;
@@ -944,29 +983,56 @@ function actRowsHtml() {
   const dt = d => new Date(d).toLocaleString('th-TH', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
   return `<div class="act-tbl">${[...groups].sort((a, b) => a[0].localeCompare(b[0], 'th')).map(([m, arr]) => `
     <div class="act-gh"><b>${esc(m)}</b><span>${arr.length} เครื่อง</span></div>
-    ${arr.map(a => `<div class="act-tr"><span class="ok-dot" title="Activated">✓</span><span class="imei-box"><span class="code imei">${esc(a.imei)}</span><span class="clr">🎨 ${esc(a.color)}</span></span>
+    ${arr.map(a => { const sel = state.actSel, ok = canEditAct(a), tag = sel && ok ? 'label' : 'div';
+      return `<${tag} class="act-tr${sel ? ' selmode' : ''}${sel?.has(a.id) ? ' picked' : ''}">${sel ? (ok ? `<input type="checkbox" class="actck" data-id="${a.id}" ${sel.has(a.id) ? 'checked' : ''}>` : '<i></i>') : '<span class="ok-dot" title="Activated">✓</span>'}<span class="imei-box"><span class="code imei">${esc(a.imei)}</span><span class="clr">🎨 ${esc(a.color)}</span></span>
       <span class="when">${dt(a.activated_at)}${a.by_name ? `<br>${esc(a.by_name)}` : ''}</span>
-      ${isIssuer() || actMine(a) ? `<button class="ghost" data-act="actDel" data-id="${a.id}" data-imei="${esc(a.imei)}" aria-label="ลบ">✕</button>` : '<i></i>'}</div>`).join('')}`).join('')}</div>`
+      ${!sel && ok ? `<span class="act-btns"><button class="ghost" data-act="actEdit" data-id="${a.id}" aria-label="แก้ไข">✎</button><button class="ghost del" data-act="actDel" data-id="${a.id}" data-imei="${esc(a.imei)}" aria-label="ลบ">✕</button></span>` : '<i></i>'}</${tag}>`; }).join('')}`).join('')}</div>`
     + (list.length > 1000 ? `<p class="muted center">แสดง 1,000 จาก ${num(list.length)} — ใช้ช่องค้นหาเพื่อกรอง</p>` : '');
 }
-const renderActs = () => { const e = $('#actList'); if (e) e.innerHTML = actRowsHtml(); const c = $('#actCount'); if (c) c.innerHTML = actStatsHtml(); const t = $('#actSum'); if (t) t.innerHTML = actSummaryHtml(); };
+const actVisible = () => { const q = state.actQ.trim().toLowerCase(); return state.acts.filter(a => canEditAct(a) && (!state.actM || a.model === state.actM) && (!q || [a.imei, a.model, a.color, a.by_name, a.note].some(x => String(x || '').toLowerCase().includes(q)))).slice(0, 1000); };
+function actSelBarHtml() {
+  if (state.pub) return '';
+  if (!state.actSel) return state.acts.some(canEditAct) ? `<button class="ghost selbtn" data-act="actSelOn">☑ เลือกหลายรายการเพื่อลบ</button>` : '';
+  const n = state.actSel.size;
+  return `<div class="selbar"><b>เลือก ${num(n)}</b><button data-act="actSelAll">เลือกทั้งหมด</button><button class="danger" data-act="actSelDel" ${n ? '' : 'disabled'}>🗑 ลบ${n ? ' ' + n : ''}</button><button data-act="actSelOff">ยกเลิก</button></div>`;
+}
+const renderSelBar = () => { const b = $('#actSelBar'); if (b) b.innerHTML = actSelBarHtml(); };
+const renderActs = () => { renderSelBar(); const e = $('#actList'); if (e) e.innerHTML = actRowsHtml(); const c = $('#actCount'); if (c) c.innerHTML = actStatsHtml(); const t = $('#actSum'); if (t) t.innerHTML = actSummaryHtml(); };
 function actStatsHtml() {
   const today = todayISO(), month = today.slice(0, 7), d = a => new Date(a.activated_at).toLocaleDateString('sv-SE');
   return `<div><b>${num(state.acts.length)}</b><small>Activate ทั้งหมด</small></div><div><b>${num(state.acts.filter(a => d(a) === today).length)}</b><small>วันนี้</small></div><div><b>${num(state.acts.filter(a => d(a).startsWith(month)).length)}</b><small>เดือนนี้</small></div>`;
 }
 
+function actAdminHtml() {
+  const sh = state.actShare, link = sh?.token ? `${location.origin}${location.pathname.replace(/index\.html$/, '')}?share=${sh.token}` : '';
+  const A = [['all', 'ทุกคนเห็นทั้งหมด'], ['own', 'ผู้เบิกเห็นเฉพาะของตัวเอง'], ['issuer', 'เฉพาะผู้จ่ายเบิก']];
+  return `<p class="hint" style="margin-top:10px">ใครเห็นเมนู Activate ในแอป (ผู้จ่ายเบิกเห็นทั้งหมดเสมอ)</p>
+    <div class="seg seg3">${A.map(([k, t]) => `<button data-act="actAccess" data-m="${k}" class="${state.actAccess === k ? 'on' : ''}">${t}</button>`).join('')}</div>
+    <p class="hint" style="margin-top:14px">ลิงก์ลับสำหรับดูตาราง Activate <b>โดยไม่ต้องล็อกอิน</b> (ดูอย่างเดียว · ไม่แสดงชื่อผู้บันทึก) — ใครมีลิงก์ก็เปิดดูได้ จนกว่าจะปิดหรือสร้างลิงก์ใหม่</p>
+    ${sh == null ? '<p class="muted">กำลังโหลด...</p>' : `<label class="chk"><input type="checkbox" id="actShareOn" ${sh.on ? 'checked' : ''}> เปิดใช้ลิงก์ดูตาราง</label>
+    ${sh.on && link ? `<div class="share-box"><input id="shareLink" readonly value="${esc(link)}"><button class="primary" data-act="shareCopy">📋 คัดลอก</button></div>
+      <div class="row" style="margin:8px 0 0"><button data-act="shareOpen">↗ เปิดดู</button><button class="danger" data-act="shareNew">🔄 สร้างลิงก์ใหม่ (ลิงก์เก่าใช้ไม่ได้)</button></div>` : ''}`}`;
+}
+async function loadActShare() {
+  if (!isIssuer()) return;
+  try { state.actShare = await rpc('act_share_get', {}); } catch { state.actShare = { on: false, token: '' }; }
+  const e = $('#actAdmin'); if (e) e.innerHTML = actAdminHtml();
+}
 function viewAct() {
+  if (isIssuer() && state.actShare == null) setTimeout(loadActShare, 0);
   return errBanner() + `<div class="stats" id="actCount">${actStatsHtml()}</div>
   <section class="card"><h2>บันทึก Activate</h2><p class="hint">กรอกครบ รุ่น · IMEI · สี แล้วกดบันทึก = <b>Activated</b> ทันที</p><div id="actForm">${actFormHtml()}</div></section>
   <section class="card"><h2>สถานะ Activate แยกตามรุ่น</h2><div id="actSum">${actSummaryHtml()}</div></section>
+  ${isIssuer() ? `<details class="card act-admin" ${state.actShare?.on ? 'open' : ''}><summary><b>🔒 สิทธิ์การดู & ลิงก์แชร์</b></summary><div id="actAdmin">${actAdminHtml()}</div></details>` : ''}
   <section class="card" style="padding:14px 12px"><h2>รายการ IMEI</h2>
     <div class="row" style="margin:0 0 10px;flex-wrap:nowrap"><input data-bind="actQ" placeholder="🔍 ค้นหา IMEI / สี / ผู้บันทึก" value="${esc(state.actQ)}" style="margin:0;flex:1"><button data-act="actExport" style="flex:0 0 auto">⬇️ Excel</button></div>
+    <div id="actSelBar">${actSelBarHtml()}</div>
     <div id="actList">${actRowsHtml()}</div></section>`;
 }
 // อ่านค่าจากฟอร์มเก็บไว้ (กันหายเวลาวาดฟอร์มใหม่)
 function actReadForm() {
   const f = state.act, g = id => $(id)?.value ?? '';
-  if ($('#actImei')) { f.imei = g('#actImei').trim(); f.model = g('#actModel').trim(); f.color = g('#actColor').trim(); f.note = g('#actNote').trim(); f.auto = !!$('#actAuto')?.checked; }
+  if ($('#actImei')) { f.imei = g('#actImei').trim(); f.model = g('#actModel').trim(); f.color = g('#actColor').trim(); f.note = g('#actNote').trim(); f.auto = !!$('#actAuto')?.checked; state.actAt = g('#actAt'); }
   return f;
 }
 const actSetInfo = html => { state.act.info = html; const e = $('#actInfo'); if (e) e.innerHTML = html; };
@@ -998,7 +1064,8 @@ const actSave = auto => guarded(async () => {
   if (!f.model) return toast(auto ? 'ไม่พบรุ่นในระบบ — กรอกรุ่นแล้วกดบันทึก' : 'กรุณาระบุรุ่น', true);
   if (!f.color) return toast('กรุณาระบุสี', true);
   const m = state.models.find(x => x.name.trim().toLowerCase() === f.model.toLowerCase());
-  await rpc('act_add', { p_imei: s, p_model_id: m ? m.id : null, p_model: f.model, p_color: f.color, p_note: f.note, p_by: opName() });
+  if (state.actAt && new Date(state.actAt) > new Date(Date.now() + 6e5)) return toast('วันที่ Activate อยู่ในอนาคตไม่ได้', true);
+  await rpc('act_add', { p_imei: s, p_model_id: m ? m.id : null, p_model: f.model, p_color: f.color, p_note: f.note, p_by: opName(), p_at: state.actAt ? new Date(state.actAt).toISOString() : null });
   // เตรียมเครื่องถัดไป: ล้าง IMEI/หมายเหตุ เก็บรุ่น+สีไว้
   Object.assign(state.act, { imei: '', note: '', info: `<p class="act-info ok">✓ Activate ${esc(s)} แล้ว — ยิงเครื่องถัดไปได้เลย</p>` });
   await loadActs(); renderActs();
@@ -1011,6 +1078,30 @@ function exportActs() {
   const rows = [[H('วันที่ Activate'), H('รุ่น'), H('IMEI'), H('สี'), H('สถานะ'), H('ผู้บันทึก'), H('หมายเหตุ')],
     ...state.acts.map(a => [T(new Date(a.activated_at).toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' })), T(a.model), { v: a.imei, s: 3 }, T(a.color), T('Activated'), T(a.by_name), T(a.note)])];
   downloadBlob(`Activate-${todayISO()}.xlsx`, XL.workbook([{ name: 'Activate', widths: [18, 30, 20, 16, 12, 18, 26], rows, freeze: true }]));
+}
+
+/* ---------- หน้าดูตาราง Activate ผ่านลิงก์ (ไม่ต้องล็อกอิน) ---------- */
+const shareToken = new URLSearchParams(location.search).get('share');
+async function loadPublic() {
+  try {
+    const { data, error } = await sb.rpc('act_public', { p_token: shareToken });
+    if (error) throw error;
+    state.pub = data?.ok ? { ok: true, at: data.at } : { ok: false };
+    state.acts = data?.ok ? data.items : [];
+  } catch (e) { state.pub = { ok: false, err: errMsg(e) }; }
+  renderPublic();
+}
+function renderPublic() {
+  document.body.classList.add('noauth', 'public');
+  const p = state.pub;
+  $('#app').innerHTML = !p ? '<p class="muted center" style="margin-top:40px">กำลังโหลด...</p>'
+    : !p.ok ? `<div class="empty" style="margin-top:24px"><i>🔒</i><b>ลิงก์นี้ปิดใช้งานแล้ว หรือไม่ถูกต้อง</b><span>${p.err ? esc(p.err) : 'ขอลิงก์ใหม่จากผู้ดูแล'}</span></div>`
+    : `<div class="news-hero"><div><small>${ORG ? esc(ORG) + ' · ' : ''}ดูอย่างเดียว</small><b>สถานะ Activate</b><small style="color:#cfd6dc;letter-spacing:0">อัปเดต ${fmt(p.at)}</small></div><button class="pub-ref" data-act="pubRefresh" aria-label="โหลดใหม่">🔄</button></div>
+      <div class="stats" id="actCount">${actStatsHtml()}</div>
+      <section class="card"><h2>แยกตามรุ่น</h2><div id="actSum">${actSummaryHtml()}</div></section>
+      <section class="card" style="padding:14px 12px"><h2>รายการ IMEI</h2>
+        <div class="row" style="margin:0 0 10px;flex-wrap:nowrap"><input data-bind="actQ" placeholder="🔍 ค้นหา IMEI / สี" value="${esc(state.actQ)}" style="margin:0;flex:1"><button data-act="actExport" style="flex:0 0 auto">⬇️ Excel</button></div>
+        <div id="actList">${actRowsHtml()}</div></section>`;
 }
 
 /* ประวัติเอกสาร */
@@ -1525,12 +1616,39 @@ const actions = {
   stockDlg: d => stockDlg(d.id),
   personDlg: d => personDlg(d.p),
   actSave: () => actSave(false),
+  actAtClear: () => { state.actAt = ''; actReadForm(); state.actAt = ''; const fe = $('#actForm'); if (fe) fe.innerHTML = actFormHtml(); },
+  actEdit: d => actEditDlg(d.id),
+  actEditSave: d => guarded(async () => {
+    const at = $('#aeAt').value, model = $('#aeModel').value.trim(), color = $('#aeColor').value.trim();
+    if (!at) return toast('กรุณาระบุวันที่', true);
+    if (new Date(at) > new Date(Date.now() + 6e5)) return toast('วันที่อยู่ในอนาคตไม่ได้', true);
+    if (!model || !color) return toast('กรุณาระบุรุ่นและสี', true);
+    const m = state.models.find(x => x.name.trim().toLowerCase() === model.toLowerCase());
+    await rpc('act_update', { p_id: +d.id, p_model_id: m ? m.id : null, p_model: model, p_color: color, p_note: $('#aeNote').value, p_at: new Date(at).toISOString() });
+    dlg().close(); await loadActs(); renderActs(); toast('แก้ไขแล้ว');
+  }),
+  actAccess: d => guarded(async () => {
+    await rpc('act_set_access', { p_mode: d.m }); state.actAccess = d.m;
+    document.querySelectorAll('[data-act=actAccess]').forEach(b => b.classList.toggle('on', b.dataset.m === d.m)); toast('บันทึกสิทธิ์แล้ว');
+  }),
+  shareCopy: async () => { const v = $('#shareLink')?.value || ''; try { await navigator.clipboard.writeText(v); toast('คัดลอกลิงก์แล้ว'); } catch { const i = $('#shareLink'); i?.select(); document.execCommand?.('copy'); toast('คัดลอกลิงก์แล้ว'); } },
+  shareOpen: () => { const v = $('#shareLink')?.value; if (v) window.open(v, '_blank'); },
+  shareNew: () => { if (!confirm('สร้างลิงก์ใหม่? ลิงก์เดิมที่ส่งไปแล้วจะเปิดไม่ได้อีก')) return; guarded(async () => { state.actShare = await rpc('act_share_set', { p_on: true, p_new: true }); $('#actAdmin').innerHTML = actAdminHtml(); toast('สร้างลิงก์ใหม่แล้ว'); }); },
+  pubRefresh: () => loadPublic(),
   actPick: d => { state.actM = d.m || ''; renderActs(); $('#actList')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); },
   actColor: d => { const c = $('#actColor'); if (c) c.value = d.v; state.act.color = d.v; },
   actExport: () => exportActs(),
+  actSelOn: () => { state.actSel = new Set(); renderActs(); },
+  actSelOff: () => { state.actSel = null; renderActs(); },
+  actSelAll: () => { const v = actVisible(); const all = v.length && v.every(a => state.actSel.has(a.id)); v.forEach(a => all ? state.actSel.delete(a.id) : state.actSel.add(a.id)); renderActs(); },
+  actSelDel: () => {
+    const ids = [...state.actSel]; if (!ids.length) return;
+    if (!confirm(`ลบรายการ Activate ${ids.length} รายการ? (ลบแล้วกู้คืนไม่ได้)`)) return;
+    guarded(async () => { const n = await rpc('act_delete_many', { p_ids: ids }); state.actSel = null; await loadActs(); renderActs(); toast(`ลบแล้ว ${n} รายการ`); });
+  },
   actDel: d => {
     if (!confirm(`ลบรายการ Activate ของ ${d.imei}?`)) return;
-    guarded(async () => { await rpc('act_delete', { p_id: +d.id }); await loadActs(); renderActs(); toast('ลบแล้ว'); });
+    guarded(async () => { await rpc('act_delete', { p_id: +d.id }); if (dlg().open) dlg().close(); await loadActs(); renderActs(); toast('ลบแล้ว'); });
   },
   tplQty: d => { const n = Math.max(0, Math.min(2000, (state.tpl[d.id] || 0) + +d.d)); if (n) state.tpl[d.id] = n; else delete state.tpl[d.id]; const i = $(`[data-tpl="${d.id}"]`); if (i) { i.value = n || ''; i.closest('.pick').classList.toggle('on', n > 0); } const t = $('#tplTotal'); if (t) t.textContent = tplTotal(); },
   tplNewAdd: () => {
@@ -1588,7 +1706,26 @@ const actions = {
     state.rcv = { model_id: null, mode: 'new', items: [], note: '' }; saveDraft();
     await refresh(); state.view = 'stock'; render(); toast(`${r.mode === 'new' ? 'รับเข้า' : 'ลง IMEI'} ${name} ${n} เครื่องแล้ว · คงเหลือ ${num(bal)}`);
   }),
-  imeiDlg: d => { state.imeiQ = ''; imeiDlg(d.id); },
+  imeiDlg: d => { state.imeiQ = ''; state.imeiSel = new Set(); imeiDlg(d.id); },
+  imeiBack: d => imeiDlg(d.id),
+  imeiSelClear: d => { state.imeiSel = new Set(); imeiDlg(d.id); },
+  devEdit: d => devEditDlg(d.imei, d.id),
+  devEditSave: d => guarded(async () => {
+    const ni = $('#deImei').value.trim().toUpperCase(), mid = +$('#deModel').value;
+    if (!/^[A-Z0-9-]{5,30}$/.test(ni)) return toast('IMEI ไม่ถูกต้อง', true);
+    if (ni === d.imei && mid === +d.id) return imeiDlg(d.id);
+    await rpc('dev_edit', { p_imei: d.imei, p_new_imei: ni, p_model_id: mid, p_by: opName() });
+    state.imeiSel.delete(d.imei); await refresh(); renderStockList(); imeiDlg(mid);
+    toast(mid !== +d.id ? `ย้าย ${ni} ไปรุ่น ${state.modelMap.get(mid)?.name || ''} แล้ว` : `แก้เป็น ${ni} แล้ว`);
+  }),
+  devDelOne: d => devDelDlg([d.imei], d.id),
+  devDelSel: d => devDelDlg([...state.imeiSel], d.id),
+  devDelGo: d => guarded(async () => {
+    const list = state.devDel || []; if (!list.length) return;
+    const n = await rpc('dev_delete', { p_imeis: list, p_keep_qty: d.keep === '1', p_by: opName() });
+    list.forEach(i => state.imeiSel.delete(i)); state.devDel = null;
+    await refresh(); renderStockList(); imeiDlg(d.id); toast(`ลบ IMEI ${n} เครื่องแล้ว${d.keep === '1' ? ' · จำนวนสต็อกคงเดิม' : ' · ลดจำนวนสต็อกแล้ว'}`);
+  }),
   imeiRemove: d => {
     const why = prompt(`ตัด ${d.imei} ออกจากสต็อก — ระบุเหตุผล (เช่น เครื่องเสีย / สูญหาย / ย้ายคลัง)`); if (why == null) return;
     if (!why.trim()) return toast('กรุณาระบุเหตุผล', true);
@@ -1735,6 +1872,17 @@ addEventListener('unhandledrejection', e => showError(e.reason));
 function onBind(e) {
   const t = e.target;
   if (t.dataset.qty) { if (e.type === 'input') setQty(+t.dataset.qty, t.value, false); else setQty(+t.dataset.qty, t.value); return; }
+  if (t.classList?.contains('actck') && e.type === 'change') {
+    const id = +t.dataset.id; if (!state.actSel) return; t.checked ? state.actSel.add(id) : state.actSel.delete(id); t.closest('.act-tr')?.classList.toggle('picked', t.checked); renderSelBar(); return;
+  }
+  if (t.classList?.contains('imeick') && e.type === 'change') {
+    t.checked ? state.imeiSel.add(t.dataset.imei) : state.imeiSel.delete(t.dataset.imei); t.closest('.mrow')?.classList.toggle('picked', t.checked);
+    const b = $('#imeiSelBar'); if (b) b.innerHTML = imeiSelBarHtml(t.dataset.id); return;
+  }
+  if (t.id === 'actShareOn' && e.type === 'change') {
+    guarded(async () => { try { state.actShare = await rpc('act_share_set', { p_on: t.checked, p_new: false }); $('#actAdmin').innerHTML = actAdminHtml(); toast(t.checked ? 'เปิดลิงก์แล้ว — คัดลอกส่งให้คนที่ต้องการดูได้เลย' : 'ปิดลิงก์แล้ว — ลิงก์เดิมเปิดไม่ได้'); } catch (err) { t.checked = !t.checked; throw err; } });
+    return;
+  }
   if (t.id === 'impFile' && e.type === 'change') { const f = t.files && t.files[0]; t.value = ''; if (f) readImportFile(f); return; }
   if (t.id === 'impCreate' && e.type === 'change') { state.impCreate = t.checked; renderImp(); return; }
   if (t.dataset.tpl) { const n = Math.max(0, Math.min(2000, Math.floor(+t.value || 0))); if (n) state.tpl[t.dataset.tpl] = n; else delete state.tpl[t.dataset.tpl]; t.closest('.pick').classList.toggle('on', n > 0); const tt = $('#tplTotal'); if (tt) tt.textContent = tplTotal(); return; }
@@ -1750,6 +1898,7 @@ function onBind(e) {
   const v = t.type === 'checkbox' ? t.checked : t.value;
   const [o, k] = b.split('.');
   if (k) state[o][k] = v; else state[o] = v;
+  if (b === 'actQ' && state.pub) { renderActs(); return; }
   if (b === 'outQ') renderOutList();
   else if (b === 'hq' || b === 'ht') renderHistoryList();
   else if (b === 'pq') renderReqList();
@@ -1818,6 +1967,7 @@ addEventListener('online', setNet); addEventListener('offline', setNet);
 /* ---------- boot ---------- */
 (async () => {
   setNet();
+  if (shareToken && configured) { renderPublic(); await loadPublic(); setInterval(() => { if (!document.hidden) loadPublic(); }, 60000); return; }
   try { state.operator = localStorage.getItem('operator') || ''; } catch { }
   if (configured) {
     loadDraft();
