@@ -14,7 +14,7 @@ const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
 const MOVE_T = { REG: 'ลง IMEI ของเดิม', SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '2.5.0';
+const APP_VER = '2.7.1';
 // เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
 const ID_DOMAIN = 'loan.local';
 const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
@@ -31,7 +31,8 @@ const sb = configured ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPAB
 const state = {
   view: '', session: null, role: 'requester', me: { name: '', dept: '', username: '' }, authTab: 'login', signupOpen: true, operator: '', busy: false, loadErr: '',
   models: [], modelMap: new Map(), reqs: [], reqLimit: 200, anns: [], annEdit: null,
-  avail: new Map(), devMap: new Map(), rcv: { model_id: null, mode: 'new', items: [], note: '' }, rcvQ: '', imeiQ: '',
+  acts: [], actQ: '', actM: '', act: { imei: '', model_id: null, model: '', color: '', note: '', info: '', auto: false },
+  avail: new Map(), devMap: new Map(), tpl: {}, tplNew: [], imp: null, impMode: 'new', impCreate: true, rcv: { model_id: null, mode: 'new', items: [], note: '' }, rcvQ: '', imeiQ: '',
   open: [], openMap: new Map(), docs: [], docsLimit: 300,
   req: { person: '', dept: '', purpose: '', note: '', qty: {} },
   ful: null, // { no, items: [{ imei, model_id }], cur: model_id }
@@ -48,20 +49,21 @@ const IC = {
   dev: '<rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M10.5 18.5h3"/>',
   box: '<path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5zM3 7.5l9 4.5 9-4.5M12 12v9"/>',
   hist: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2V3zM9 8h6M9 12h6"/>',
+  act: '<rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M9 12.2l2.1 2.1L15 10.4"/>',
   news: '<path d="M3 10.5v3h2.5L12 18V6L5.5 10.5H3zM15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/>'
 };
 const NAV = {
-  requester: [['request', 'ขอเบิก', 'req'], ['requests', 'คำขอของฉัน', 'list'], ['news', 'ประกาศ', 'news']],
-  issuer: [['requests', 'คำขอ', 'list'], ['return', 'รับคืน', 'ret'], ['out', 'ค้างอยู่', 'dev'], ['stock', 'สต็อก', 'box'], ['news', 'ประกาศ', 'news'], ['history', 'ประวัติ', 'hist']]
+  requester: [['request', 'ขอเบิก', 'req'], ['requests', 'คำขอของฉัน', 'list'], ['act', 'Activate', 'act'], ['news', 'ประกาศ', 'news']],
+  issuer: [['requests', 'คำขอ', 'list'], ['return', 'รับคืน', 'ret'], ['out', 'ค้างอยู่', 'dev'], ['stock', 'สต็อก', 'box'], ['act', 'Activate', 'act'], ['news', 'ประกาศ', 'news'], ['history', 'ประวัติ', 'hist']]
 };
-const EXTRA = { requester: ['settings'], issuer: ['request', 'fulfill', 'receive', 'settings'] };
+const EXTRA = { requester: ['settings'], issuer: ['request', 'fulfill', 'receive', 'import', 'settings'] };
 const allowed = v => NAV[state.role].some(x => x[0] === v) || EXTRA[state.role].includes(v);
 const fixView = () => { if (!allowed(state.view)) state.view = NAV[state.role][0][0]; };
 
 function renderNav() {
   const pend = state.reqs.filter(r => r.status === 'PENDING').length;
   const badge = { requests: pend, out: state.open.length, news: annUnseen() };
-  const on = v => state.view === v || (v === 'requests' && state.view === 'fulfill') || (v === 'stock' && state.view === 'receive');
+  const on = v => state.view === v || (v === 'requests' && state.view === 'fulfill') || (v === 'stock' && /^(receive|import)$/.test(state.view));
   $('#nav').innerHTML = state.session ? NAV[state.role].map(([v, t, i]) => `<button data-view="${v}" class="${on(v) ? 'on' : ''}" data-n="${badge[v] || ''}"><svg viewBox="0 0 24 24">${IC[i]}</svg><span>${t}</span></button>`).join('') : '';
   renderTicker();
   const rb = $('#role'); if (rb) { rb.hidden = !state.session; rb.textContent = ROLE_T[state.role]; rb.className = 'badge' + (isIssuer() ? ' warn' : ''); }
@@ -122,6 +124,128 @@ function cleanDraft() {
   saveDraft();
 }
 
+/* ---------- Excel (.xlsx) แบบเบา: เขียน/อ่านเองในเบราว์เซอร์ ไม่ต้องโหลดไลบรารี ---------- */
+const XL = (() => {
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const crcT = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  const crc32 = b => { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = crcT[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+  function zip(files) {
+    const parts = [], cd = []; let off = 0;
+    for (const f of files) {
+      const nm = enc.encode(f.name), d = enc.encode(f.data), c = crc32(d);
+      const h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(12, 0x21, true);
+      h.setUint32(14, c, true); h.setUint32(18, d.length, true); h.setUint32(22, d.length, true); h.setUint16(26, nm.length, true);
+      parts.push(new Uint8Array(h.buffer), nm, d);
+      const e = new DataView(new ArrayBuffer(46));
+      e.setUint32(0, 0x02014b50, true); e.setUint16(4, 20, true); e.setUint16(6, 20, true); e.setUint16(8, 0x0800, true); e.setUint16(14, 0x21, true);
+      e.setUint32(16, c, true); e.setUint32(20, d.length, true); e.setUint32(24, d.length, true); e.setUint16(28, nm.length, true); e.setUint32(42, off, true);
+      cd.push(new Uint8Array(e.buffer), nm);
+      off += 30 + nm.length + d.length;
+    }
+    const size = cd.reduce((a, x) => a + x.length, 0), end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, size, true); end.setUint32(16, off, true);
+    return new Blob([...parts, ...cd, new Uint8Array(end.buffer)], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+  const x = v => String(v ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  const col = i => { let s = ''; i++; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
+  // sheet: { name, widths:[...], rows:[[{v, s, n}]], freeze, validation:{sqref, formula} }  s = style index · n = ตัวเลข
+  function sheetXml(sh) {
+    const rows = sh.rows.map((r, ri) => `<row r="${ri + 1}">${r.map((c, ci) => { if (c == null) return ''; const ref = col(ci) + (ri + 1), st = c.s ? ` s="${c.s}"` : '';
+      if (c.v === '' || c.v == null) return `<c r="${ref}"${st}/>`;
+      return c.n ? `<c r="${ref}"${st}><v>${c.v}</v></c>` : `<c r="${ref}"${st} t="inlineStr"><is><t xml:space="preserve">${x(c.v)}</t></is></c>`; }).join('')}</row>`).join('');
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">`
+      + (sh.freeze ? `<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>` : '')
+      + `<cols>${(sh.widths || []).map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('')}</cols><sheetData>${rows}</sheetData>`
+      + (sh.validation ? `<dataValidations count="1"><dataValidation type="list" allowBlank="1" showErrorMessage="0" sqref="${sh.validation.sqref}"><formula1>${x(sh.validation.formula)}</formula1></dataValidation></dataValidations>` : '')
+      + `</worksheet>`;
+  }
+  const STYLES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="4"><font><sz val="11"/><name val="Tahoma"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Tahoma"/></font><font><b/><sz val="14"/><name val="Tahoma"/></font><font><sz val="10"/><color rgb="FF5D6A75"/><name val="Tahoma"/></font></fonts>
+<fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF101820"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFF6D6"/><bgColor indexed="64"/></patternFill></fill></fills>
+<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color rgb="FFC9D0D6"/></left><right style="thin"><color rgb="FFC9D0D6"/></right><top style="thin"><color rgb="FFC9D0D6"/></top><bottom style="thin"><color rgb="FFC9D0D6"/></bottom><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/><xf numFmtId="49" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/><xf numFmtId="49" fontId="0" fillId="3" borderId="1" xfId="0" applyNumberFormat="1" applyFill="1" applyBorder="1"/><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`;
+  function workbook(sheets) {
+    const files = [
+      { name: '[Content_Types].xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('')}</Types>` },
+      { name: '_rels/.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>` },
+      { name: 'xl/workbook.xml', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((sh, i) => `<sheet name="${x(sh.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('')}</sheets></workbook>` },
+      { name: 'xl/_rels/workbook.xml.rels', data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('')}<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>` },
+      { name: 'xl/styles.xml', data: STYLES },
+      ...sheets.map((sh, i) => ({ name: `xl/worksheets/sheet${i + 1}.xml`, data: sheetXml(sh) }))
+    ];
+    return zip(files);
+  }
+  // ---- อ่าน .xlsx (รองรับไฟล์จาก Excel / Google Sheets / LibreOffice)
+  async function unzip(buf) {
+    const dv = new DataView(buf), u8 = new Uint8Array(buf); let eocd = -1;
+    for (let i = buf.byteLength - 22; i >= Math.max(0, buf.byteLength - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    if (eocd < 0) throw new Error('ไฟล์นี้ไม่ใช่ Excel (.xlsx)');
+    const n = dv.getUint16(eocd + 10, true), ent = {}; let p = dv.getUint32(eocd + 16, true);
+    for (let k = 0; k < n; k++) {
+      const nl = dv.getUint16(p + 28, true), el = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
+      ent[dec.decode(u8.subarray(p + 46, p + 46 + nl))] = { m: dv.getUint16(p + 10, true), size: dv.getUint32(p + 20, true), lho: dv.getUint32(p + 42, true) };
+      p += 46 + nl + el + cl;
+    }
+    return async name => {
+      const e = ent[name]; if (!e) return null;
+      const st = e.lho + 30 + dv.getUint16(e.lho + 26, true) + dv.getUint16(e.lho + 28, true), data = u8.subarray(st, st + e.size);
+      if (e.m === 0) return dec.decode(data);
+      if (e.m !== 8) throw new Error('รูปแบบไฟล์ไม่รองรับ');
+      if (typeof DecompressionStream === 'undefined') throw new Error('เบราว์เซอร์นี้เปิด .xlsx ไม่ได้ — บันทึกเป็น CSV แล้วนำเข้าแทน');
+      return await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+    };
+  }
+  const parse = t => new DOMParser().parseFromString(t, 'application/xml');
+  const tags = (n, t) => [...n.getElementsByTagNameNS('*', t)];
+  const colIdx = r => { const m = /^([A-Z]+)/.exec(r || ''); let n = 0; if (!m) return -1; for (const ch of m[1]) n = n * 26 + ch.charCodeAt(0) - 64; return n - 1; };
+  // คืนค่า { sheets: [{name, rows:[[string]]}] }
+  async function readXlsx(buf) {
+    const read = await unzip(buf);
+    const wb = parse(await read('xl/workbook.xml') || ''), rels = parse(await read('xl/_rels/workbook.xml.rels') || '');
+    const ss = await read('xl/sharedStrings.xml'), shared = ss ? tags(parse(ss), 'si').map(si => tags(si, 't').map(t => t.textContent).join('')) : [];
+    const target = {}; tags(rels, 'Relationship').forEach(r => target[r.getAttribute('Id')] = r.getAttribute('Target'));
+    const out = [];
+    for (const sh of tags(wb, 'sheet')) {
+      const rid = sh.getAttribute('r:id') || [...sh.attributes].find(a => a.localName === 'id')?.value;
+      let t = target[rid] || ''; t = t.startsWith('/') ? t.slice(1) : 'xl/' + t.replace(/^\.\//, '');
+      const xml = await read(t); if (!xml) continue;
+      const rows = [];
+      tags(parse(xml), 'row').forEach(r => {
+        const ri = (+r.getAttribute('r') || rows.length + 1) - 1, row = [];
+        tags(r, 'c').forEach((c, k) => {
+          const ci = c.getAttribute('r') ? colIdx(c.getAttribute('r')) : k, ty = c.getAttribute('t'), v = tags(c, 'v')[0]?.textContent ?? '';
+          let val = ty === 's' ? (shared[+v] ?? '') : ty === 'inlineStr' ? tags(c, 't').map(t => t.textContent).join('') : v;
+          if ((!ty || ty === 'n') && /^-?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(val)) { const num = Number(val); if (Number.isInteger(num) && Math.abs(num) < 1e16) val = num.toFixed(0); }
+          row[ci] = val;
+        });
+        rows[ri] = row;
+      });
+      out.push({ name: sh.getAttribute('name'), rows: Array.from(rows, r => Array.from(r || [], v => v ?? '')) });
+    }
+    return { sheets: out };
+  }
+  function readCsv(text) {
+    text = text.replace(/^﻿/, '');
+    const first = text.split(/\r?\n/)[0] || '', d = [',', ';', '\t'].sort((a, b) => first.split(b).length - first.split(a).length)[0];
+    const rows = []; let row = [], cur = '', q = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (q) { if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+      else if (ch === '"') q = true;
+      else if (ch === d) { row.push(cur); cur = ''; }
+      else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(cur); rows.push(row); row = []; cur = ''; }
+      else cur += ch;
+    }
+    if (cur || row.length) { row.push(cur); rows.push(row); }
+    return { sheets: [{ name: 'CSV', rows }] };
+  }
+  return { workbook, readXlsx, readCsv };
+})();
+const downloadBlob = (name, blob) => { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); };
+
 /* ---------- data (Supabase) ---------- */
 async function fetchAll(build) {
   const out = [];
@@ -155,6 +279,9 @@ async function loadDevices() {
 const availOf = id => state.avail.get(id)?.avail ?? (state.modelMap.get(id)?.stock || 0);
 const regOf = id => state.avail.get(id)?.registered ?? 0;
 const unregOf = id => Math.max(0, (state.modelMap.get(id)?.stock || 0) - regOf(id));
+async function loadActs() {
+  state.acts = await fetchAll((a, b) => sb.from('activations').select('*').order('activated_at', { ascending: false }).order('id', { ascending: false }).range(a, b));
+}
 async function loadAnns() {
   const { data, error } = await sb.from('announcements').select('*').order('pinned', { ascending: false }).order('created_at', { ascending: false }).limit(100);
   if (error) throw error;
@@ -184,7 +311,7 @@ async function refresh() {
   if (!sb || !state.session) return;
   try {
     await loadRole();
-    const jobs = [loadModels(), loadReqs(), loadAppConfig(), loadAnns(), loadAvail()];
+    const jobs = [loadModels(), loadReqs(), loadAppConfig(), loadAnns(), loadAvail(), loadActs()];
     if (isIssuer()) jobs.push(loadOpen(), loadDocs(), loadDevices()); else { state.open = []; state.openMap = new Map(); state.docs = []; state.devMap = new Map(); }
     await Promise.all(jobs); state.loadErr = '';
   } catch (e) { state.loadErr = errMsg(e); }
@@ -264,7 +391,7 @@ function normImei(raw) {
   if (!state.loose) { const m = s.match(/\d{15}/); if (m) s = m[0]; }
   return s.toUpperCase();
 }
-const addImei = (kind, raw) => kind === 'ful' ? addFul(raw) : kind === 'rcv' ? addRcv(raw) : addReturn(raw);
+const addImei = (kind, raw) => kind === 'ful' ? addFul(raw) : kind === 'rcv' ? addRcv(raw) : kind === 'act' ? actScan(raw) : addReturn(raw);
 
 const retLoans = () => state.retPerson ? state.open.filter(l => l.person === state.retPerson) : [];
 const retMissing = () => { const got = new Set(state.cart.return.map(x => x.imei)); return retLoans().filter(l => !got.has(l.imei)); };
@@ -600,7 +727,7 @@ function stockListHtml() {
 const renderStockList = () => { const e = $('#stockList'); if (e) e.innerHTML = stockListHtml(); };
 function viewStock() {
   const act = state.models.filter(m => m.active), tot = act.reduce((a, m) => a + m.stock, 0), reg = act.reduce((a, m) => a + regOf(m.id), 0);
-  return errBanner() + `<button class="primary big" data-act="rcvGo" style="margin:0 0 14px">📥 รับเข้าสต็อก (ยิง IMEI)</button>
+  return errBanner() + `<div class="row" style="margin:0 0 14px"><button class="primary big" data-act="rcvGo" style="margin:0;flex:3">📥 รับเข้าสต็อก (ยิง IMEI)</button><button class="big" data-view="import" style="margin:0;flex:2">📄 Excel</button></div>
   <div class="stats"><div><b>${num(tot)}</b><small>คงเหลือทั้งหมด</small></div><div><b>${num(reg)}</b><small>ลง IMEI แล้ว</small></div><div><b>${num(state.open.length)}</b><small>ถูกเบิกอยู่</small></div></div>
   <details class="card" style="padding:12px 14px" ${state.models.length ? '' : 'open'}><summary style="cursor:pointer;font-weight:700">＋ เพิ่มรุ่นใหม่</summary>
     <div class="row" style="margin:10px 0 0"><label style="flex:2;margin:0">ชื่อรุ่น<input data-bind="newModel" value="${esc(state.newModel)}" placeholder="เช่น iPhone 15 128GB"></label>
@@ -665,6 +792,225 @@ function imeiDlg(id) {
     <button class="primary big" data-act="rcvGo" data-id="${m.id}">📥 รับเข้า IMEI รุ่นนี้</button>
     <button class="big" data-act="closeDlg">ปิด</button>`);
   const f = $('#imeiFind'); if (f) { f.oninput = () => { state.imeiQ = f.value; const pos = f.selectionStart; imeiDlg(id); const g = $('#imeiFind'); g?.focus(); g?.setSelectionRange(pos, pos); }; }
+}
+
+/* ---------- นำเข้า/ส่งออกตาราง IMEI (Excel) ---------- */
+const tplTotal = () => Object.values(state.tpl).reduce((a, n) => a + n, 0) + state.tplNew.reduce((a, r) => a + r.qty, 0);
+function tplListHtml() {
+  const ms = state.models.filter(m => m.active);
+  return (ms.length ? ms.map(m => { const n = state.tpl[m.id] || 0; return `<div class="pick ${n ? 'on' : ''}" id="tp-${m.id}"><div class="nm">${esc(m.name)}<small class="stk-sub">คงเหลือ ${num(m.stock)}${unregOf(m.id) ? ` · ยังไม่ลง IMEI ${unregOf(m.id)}` : ''}</small></div>
+    <div class="step"><button data-act="tplQty" data-id="${m.id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="2000" data-tpl="${m.id}" value="${n || ''}" placeholder="0"><button data-act="tplQty" data-id="${m.id}" data-d="1" aria-label="เพิ่ม">+</button></div></div>`; }).join('') : '')
+    + state.tplNew.map((r, i) => `<div class="pick on"><div class="nm">${esc(r.name)} <span class="badge pri">รุ่นใหม่</span></div><b class="bignum" style="font-size:18px">${r.qty}</b><button class="ghost" data-act="tplNewDel" data-i="${i}" aria-label="ลบ">✕</button></div>`).join('')
+    + `<div class="row" style="margin:10px 0 0"><input id="tpNewName" placeholder="รุ่นใหม่ที่ยังไม่มีในระบบ (ถ้ามี)" style="flex:3;margin:0"><input id="tpNewQty" type="number" inputmode="numeric" min="1" placeholder="จำนวน" style="flex:1;margin:0"><button data-act="tplNewAdd" style="flex:0 0 auto">เพิ่ม</button></div>`;
+}
+function renderTpl() { const e = $('#tplList'); if (e) e.innerHTML = tplListHtml(); const t = $('#tplTotal'); if (t) t.textContent = tplTotal(); }
+function exportTemplate() {
+  const H = v => ({ v, s: 1 }), T = v => ({ v, s: 2 }), I = () => ({ v: '', s: 3 });
+  const rows = [[H('ลำดับ'), H('รุ่น'), H('IMEI / ซีเรียล'), H('หมายเหตุ')]];
+  let k = 0;
+  const add = (name, n) => { for (let i = 0; i < n; i++) rows.push([{ v: ++k, s: 2, n: 1 }, T(name), I(), T('')]); };
+  state.models.filter(m => state.tpl[m.id] > 0).forEach(m => add(m.name, state.tpl[m.id]));
+  state.tplNew.forEach(r => add(r.name, r.qty));
+  for (let i = 0; i < (k ? 10 : 50); i++) rows.push([{ v: ++k, s: 2, n: 1 }, T(''), I(), T('')]); // แถวว่างเผื่อเพิ่มเอง
+  const names = [...state.models.filter(m => m.active).map(m => m.name), ...state.tplNew.map(r => r.name)];
+  const guide = [[{ v: 'วิธีใช้ตารางรับเข้าสต็อก', s: 4 }], [], ...[
+    '1) กรอก IMEI ในคอลัมน์ C (ช่องสีเหลือง) ทีละ 1 เครื่องต่อ 1 แถว — ยิงบาร์โค้ดลงช่องได้เลย',
+    '2) คอลัมน์ B คือรุ่น ต้องตรงกับชื่อรุ่นในระบบ (เลือกจากรายการได้) · ใส่ชื่อรุ่นใหม่ได้ ระบบจะถามก่อนสร้าง',
+    '3) แถวที่ไม่กรอก IMEI จะถูกข้ามไป ไม่ต้องลบ',
+    '4) อย่าเปลี่ยนคอลัมน์ C เป็นตัวเลข (ให้เป็นข้อความ) เพื่อไม่ให้ Excel แปลงเลขยาวเป็น 3.57E+14',
+    '5) บันทึกไฟล์ แล้วไปที่ แอป → สต็อก → นำเข้า/ส่งออก Excel → เลือกไฟล์นี้',
+    `ไฟล์สร้างเมื่อ ${new Date().toLocaleString('th-TH')} · ระบบเบิก/คืนเครื่อง v${APP_VER}`].map(t => [{ v: t, s: 5 }])];
+  const wb = XL.workbook([
+    { name: 'กรอก IMEI', widths: [8, 34, 24, 26], rows, freeze: true, validation: names.length ? { sqref: `B2:B${rows.length + 500}`, formula: `'รายชื่อรุ่น'!$A$2:$A$${names.length + 1}` } : null },
+    { name: 'รายชื่อรุ่น', widths: [40], rows: [[{ v: 'รุ่นในระบบ', s: 1 }], ...names.map(n => [{ v: n, s: 2 }])] },
+    { name: 'วิธีใช้', widths: [110], rows: guide }
+  ]);
+  downloadBlob(`ตาราง-IMEI-${todayISO()}.xlsx`, wb);
+  toast(`ดาวน์โหลดตาราง ${k} แถวแล้ว — กรอก IMEI แล้วนำเข้ากลับมา`);
+}
+// แปลงตารางเป็นรายการ {line, model, imei, note} — หาแถวหัวตารางที่มีคำว่า IMEI
+function rowsToItems(book) {
+  const sh = book.sheets.find(x => /imei/i.test(x.name)) || book.sheets.find(x => x.rows.some(r => (r || []).some(c => /imei/i.test(c)))) || book.sheets[0];
+  if (!sh) throw new Error('ไม่พบข้อมูลในไฟล์');
+  const rows = sh.rows; let h = rows.findIndex(r => (r || []).some(c => /imei|ซีเรียล|serial/i.test(String(c))));
+  let ci = 2, cm = 1, cn = 3;
+  if (h >= 0) { const r = rows[h].map(c => String(c || '')); ci = r.findIndex(c => /imei|ซีเรียล|serial/i.test(c)); cm = r.findIndex(c => /รุ่น|model/i.test(c)); cn = r.findIndex(c => /หมายเหตุ|note/i.test(c)); } else h = -1;
+  const out = [];
+  for (let i = h + 1; i < rows.length; i++) { const r = rows[i] || []; const imei = String(r[ci] ?? '').trim(), model = cm >= 0 ? String(r[cm] ?? '').trim() : '';
+    if (!imei && !model) continue; out.push({ line: i + 1, model, imei, note: cn >= 0 ? String(r[cn] ?? '').trim() : '' }); }
+  return { sheet: sh.name, items: out, noModelCol: cm < 0 };
+}
+function analyzeImport() {
+  const im = state.imp; if (!im) return;
+  const byName = new Map(state.models.map(m => [m.name.trim().toLowerCase(), m]));
+  const seen = new Set(), groups = new Map(), problems = []; let blank = 0;
+  im.items.forEach(it => {
+    const raw = it.imei; if (!raw) { blank++; return; }
+    const s = normImei(raw), key = it.model.toLowerCase(), m = byName.get(key);
+    let why = '';
+    if (/e\+?\d+$/i.test(raw.replace(/\s/g, '')) && /\./.test(raw)) why = 'Excel แปลงเป็นตัวเลขวิทยาศาสตร์ (ตั้งคอลัมน์ IMEI เป็นข้อความ)';
+    else if (!validImei(s)) why = 'IMEI ไม่ถูกต้อง';
+    else if (seen.has(s)) why = 'ซ้ำในไฟล์';
+    else if (state.devMap.has(s)) why = `มีในสต็อกแล้ว (${mName(state.devMap.get(s))})`;
+    else if (state.openMap.has(s)) why = `ถูกเบิกอยู่ (${state.openMap.get(s).person})`;
+    else if (!it.model) why = 'ไม่ได้ระบุรุ่น';
+    else if (!m && !state.impCreate) why = `ไม่มีรุ่น “${it.model}” ในระบบ`;
+    if (why) { problems.push({ ...it, imei: s || raw, why }); return; }
+    seen.add(s);
+    const gk = m ? 'id:' + m.id : 'new:' + key;
+    if (!groups.has(gk)) groups.set(gk, { model: m || null, name: m ? m.name : it.model, imeis: [], isNew: !m });
+    groups.get(gk).imeis.push(s);
+  });
+  im.groups = [...groups.values()]; im.problems = problems; im.blank = blank;
+  im.ok = im.groups.reduce((a, g) => a + g.imeis.length, 0);
+  // โหมดลง IMEI ของเดิม: ต้องไม่เกินจำนวนที่ยังไม่ลง
+  im.groups.forEach(g => { g.over = state.impMode === 'register' ? Math.max(0, g.imeis.length - (g.model ? unregOf(g.model.id) : 0)) : 0; });
+}
+function impPreviewHtml() {
+  const im = state.imp; if (!im) return '';
+  const over = im.groups.some(g => g.over);
+  return `<div class="imp-file">📄 <b>${esc(im.fileName)}</b><small>ชีต “${esc(im.sheet)}” · ${im.items.length} แถว${im.blank ? ` · ข้ามแถวที่ไม่กรอก IMEI ${im.blank}` : ''}</small></div>
+    ${im.groups.length ? `<table class="imp-t"><tr><th>รุ่น</th><th class="r">IMEI</th><th class="r">หลังนำเข้า</th></tr>${im.groups.map(g => { const st = g.model ? g.model.stock : 0, after = state.impMode === 'new' ? st + g.imeis.length : st;
+      return `<tr><td class="txt">${esc(g.name)}${g.isNew ? ' <span class="badge pri">สร้างรุ่นใหม่</span>' : ''}${g.over ? `<small class="warn-t">ของเดิมไม่ลง IMEI มีแค่ ${g.model ? unregOf(g.model.id) : 0} — เกิน ${g.over}</small>` : ''}</td><td class="r">${g.imeis.length}</td><td class="r">${num(after)}</td></tr>`; }).join('')}</table>` : ''}
+    ${im.problems.length ? `<details class="imp-bad" ${im.ok ? '' : 'open'}><summary><b>${im.problems.length} แถวมีปัญหา</b> — จะไม่ถูกนำเข้า (แตะเพื่อดู)</summary>
+      <table class="imp-t">${im.problems.slice(0, 300).map(p => `<tr><td>แถว ${p.line}</td><td>${esc(p.imei)}</td><td class="txt">${esc(p.why)}</td></tr>`).join('')}</table>
+      <button data-act="impBadExport" style="width:100%;margin-top:8px">⬇️ ดาวน์โหลดรายการที่มีปัญหา</button></details>` : ''}
+    ${over ? '<p class="badge err" style="display:block;white-space:normal;margin-top:10px">โหมด “ลง IMEI ของเดิม” ยิงเกินจำนวนของเดิม — เปลี่ยนเป็น “รับเข้าใหม่” หรือแก้ไฟล์</p>' : ''}
+    <div class="cta cta-static" style="margin-top:12px"><div class="sum"><span>${im.groups.length} รุ่น · ${im.problems.length ? `ข้าม ${im.problems.length}` : 'ไม่มีปัญหา'}</span><b>${im.ok} เครื่อง</b></div>
+    <button class="primary big" data-act="impCommit" ${im.ok && !over ? '' : 'disabled'}>📥 นำเข้า ${im.ok} เครื่อง</button></div>`;
+}
+const renderImp = () => { analyzeImport(); const e = $('#impPreview'); if (e) e.innerHTML = impPreviewHtml(); };
+function viewImport() {
+  return errBanner() + `<button class="ghost" data-view="stock" style="margin-bottom:8px">← กลับไปหน้าสต็อก</button>
+  <section class="card"><h2>① ดาวน์โหลดตารางไปกรอก IMEI</h2>
+    <p class="hint">เลือกรุ่นและจำนวนเครื่อง → ดาวน์โหลดไฟล์ Excel ที่มีรุ่นใส่ไว้ให้แล้ว → กรอก/ยิง IMEI ลงคอลัมน์สีเหลือง</p>
+    <div id="tplList">${tplListHtml()}</div>
+    <button class="primary big" data-act="tplExport">⬇️ ดาวน์โหลดตาราง Excel (<span id="tplTotal">${tplTotal()}</span> แถว)</button>
+    <small style="margin-top:6px">ไม่เลือกรุ่นก็ได้ — จะได้ตารางเปล่า 50 แถวไว้กรอกเอง</small></section>
+  <section class="card"><h2>② นำเข้าไฟล์ที่กรอกแล้ว</h2>
+    <div class="seg" style="margin-bottom:6px"><button data-act="impMode" data-m="new" class="${state.impMode === 'new' ? 'on' : ''}">📦 รับเข้าใหม่</button><button data-act="impMode" data-m="register" class="${state.impMode === 'register' ? 'on' : ''}">🏷️ ลง IMEI ของเดิม</button></div>
+    <small style="margin-bottom:10px">${state.impMode === 'new' ? 'เครื่องเข้ามาใหม่ — สต็อกเพิ่มตามจำนวน IMEI' : 'เครื่องที่มีอยู่แล้วแต่ยังไม่มี IMEI — สต็อกไม่เปลี่ยน'}</small>
+    <label class="chk" style="margin-bottom:10px"><input type="checkbox" id="impCreate" ${state.impCreate ? 'checked' : ''}> สร้างรุ่นใหม่ให้อัตโนมัติ ถ้าในไฟล์มีรุ่นที่ยังไม่มีในระบบ</label>
+    <label class="filebtn">📂 เลือกไฟล์ (.xlsx หรือ .csv)<input type="file" id="impFile" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" hidden></label>
+    <div id="impPreview">${impPreviewHtml()}</div></section>`;
+}
+async function readImportFile(file) {
+  try {
+    const buf = await file.arrayBuffer();
+    const book = /\.csv$/i.test(file.name) || file.type === 'text/csv' ? XL.readCsv(new TextDecoder().decode(buf)) : await XL.readXlsx(buf);
+    const r = rowsToItems(book);
+    if (!r.items.length) throw new Error('ไม่พบแถวที่มีข้อมูล — ตรวจว่ามีคอลัมน์ IMEI');
+    state.imp = { fileName: file.name, ...r };
+    renderImp();
+    toast(`อ่านไฟล์แล้ว ${r.items.length} แถว — ตรวจรายการก่อนกดนำเข้า`);
+  } catch (e) { state.imp = null; renderImp(); toast('อ่านไฟล์ไม่ได้: ' + (e.message || e), true); }
+}
+
+/* ---------- Activate ---------- */
+const actMine = a => a.created_by === state.session?.user?.id;
+const recentColors = () => [...new Set(state.acts.map(a => a.color).filter(Boolean))].slice(0, 8);
+function actFormHtml() {
+  const f = state.act, colors = recentColors();
+  return `<label>IMEI * <small style="display:inline">(ยิงบาร์โค้ด / พิมพ์แล้วกด Enter)</small>
+      <div class="row" style="margin:4px 0 0;flex-wrap:nowrap"><input id="actImei" value="${esc(f.imei)}" inputmode="numeric" autocomplete="off" placeholder="ยิง IMEI ที่นี่" enterkeyhint="next" style="margin:0;flex:1;font-family:var(--mono)">
+      <button data-act="scan" data-k="act" style="flex:0 0 auto" aria-label="สแกนด้วยกล้อง">📷</button></div></label>
+    <div id="actInfo">${f.info}</div>
+    <label>รุ่น *<input id="actModel" list="actModels" value="${esc(f.model)}" placeholder="ระบบเติมให้ถ้า IMEI อยู่ในสต็อก" autocomplete="off"></label>
+    <datalist id="actModels">${state.models.map(m => `<option value="${esc(m.name)}">`).join('')}</datalist>
+    <label>สี *<input id="actColor" list="actColors" value="${esc(f.color)}" placeholder="เช่น ดำ / ขาว / Titanium Blue" autocomplete="off"></label>
+    <datalist id="actColors">${colors.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+    ${colors.length ? `<div class="chips" style="margin:-4px 0 12px">${colors.map(c => `<button class="rchip" data-act="actColor" data-v="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : ''}
+    <label>หมายเหตุ<input id="actNote" value="${esc(f.note)}" placeholder="ไม่บังคับ"></label>
+    <label class="chk" style="margin-bottom:12px"><input type="checkbox" id="actAuto" ${f.auto ? 'checked' : ''}> ยิงแล้วบันทึกทันที (ใช้รุ่นที่ระบบหาเจอ + สีที่กรอกไว้) — เหมาะกับ Activate หลายเครื่องสีเดียวกัน</label>
+    <button class="primary big" data-act="actSave" style="margin-top:0">✅ บันทึก Activate</button>`;
+}
+// ตารางสรุป: ทุกรุ่นเรียงลงมา 1 บรรทัด/รุ่น (รวมรุ่นที่ยังไม่มีการ Activate) · แตะเพื่อดูเฉพาะรุ่นนั้น
+function actSummaryHtml() {
+  const today = todayISO(), cnt = new Map();
+  state.acts.forEach(a => { const g = cnt.get(a.model) || { n: 0, t: 0 }; g.n++; if (new Date(a.activated_at).toLocaleDateString('sv-SE') === today) g.t++; cnt.set(a.model, g); });
+  state.models.filter(m => m.active).forEach(m => { if (!cnt.has(m.name)) cnt.set(m.name, { n: 0, t: 0 }); });
+  const rows = [...cnt].sort((a, b) => a[0].localeCompare(b[0], 'th'));
+  if (!rows.length) return '<p class="muted center" style="margin:0">ยังไม่มีรุ่น</p>';
+  return `<table class="sum-t"><thead><tr><th>รุ่น</th><th class="r">Activated</th><th class="r">วันนี้</th></tr></thead><tbody>
+    <tr class="${state.actM ? '' : 'sel'}" data-act="actPick" data-m=""><td><b>ทุกรุ่น</b></td><td class="r"><b>${num(state.acts.length)}</b></td><td class="r">${num(rows.reduce((a, [, g]) => a + g.t, 0))}</td></tr>
+    ${rows.map(([m, g]) => `<tr class="${state.actM === m ? 'sel' : ''} ${g.n ? '' : 'zero'}" data-act="actPick" data-m="${esc(m)}"><td>${esc(m)}</td><td class="r">${num(g.n)}</td><td class="r">${g.t ? num(g.t) : '–'}</td></tr>`).join('')}</tbody></table>`;
+}
+// รายการ IMEI แบบตารางแน่น จัดกลุ่มตามรุ่น
+function actRowsHtml() {
+  const q = state.actQ.trim().toLowerCase();
+  const list = state.acts.filter(a => (!state.actM || a.model === state.actM) && (!q || [a.imei, a.model, a.color, a.by_name, a.note].some(x => String(x || '').toLowerCase().includes(q))));
+  if (!list.length) return `<div class="empty"><i>📱</i><b>${state.acts.length ? 'ไม่พบรายการ' : 'ยังไม่มีเครื่องที่ Activate'}</b>${state.acts.length ? '<span>ลองล้างคำค้นหา หรือเลือก “ทุกรุ่น”</span>' : '<span>บันทึกเครื่องแรกจากฟอร์มด้านบน</span>'}</div>`;
+  const groups = new Map(); list.slice(0, 1000).forEach(a => { if (!groups.has(a.model)) groups.set(a.model, []); groups.get(a.model).push(a); });
+  const dt = d => new Date(d).toLocaleString('th-TH', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  return `<div class="act-tbl">${[...groups].sort((a, b) => a[0].localeCompare(b[0], 'th')).map(([m, arr]) => `
+    <div class="act-gh"><b>${esc(m)}</b><span>${arr.length} เครื่อง</span></div>
+    ${arr.map(a => `<div class="act-tr"><span class="ok-dot" title="Activated">✓</span><span class="imei-box"><span class="code imei">${esc(a.imei)}</span><span class="clr">🎨 ${esc(a.color)}</span></span>
+      <span class="when">${dt(a.activated_at)}${a.by_name ? `<br>${esc(a.by_name)}` : ''}</span>
+      ${isIssuer() || actMine(a) ? `<button class="ghost" data-act="actDel" data-id="${a.id}" data-imei="${esc(a.imei)}" aria-label="ลบ">✕</button>` : '<i></i>'}</div>`).join('')}`).join('')}</div>`
+    + (list.length > 1000 ? `<p class="muted center">แสดง 1,000 จาก ${num(list.length)} — ใช้ช่องค้นหาเพื่อกรอง</p>` : '');
+}
+const renderActs = () => { const e = $('#actList'); if (e) e.innerHTML = actRowsHtml(); const c = $('#actCount'); if (c) c.innerHTML = actStatsHtml(); const t = $('#actSum'); if (t) t.innerHTML = actSummaryHtml(); };
+function actStatsHtml() {
+  const today = todayISO(), month = today.slice(0, 7), d = a => new Date(a.activated_at).toLocaleDateString('sv-SE');
+  return `<div><b>${num(state.acts.length)}</b><small>Activate ทั้งหมด</small></div><div><b>${num(state.acts.filter(a => d(a) === today).length)}</b><small>วันนี้</small></div><div><b>${num(state.acts.filter(a => d(a).startsWith(month)).length)}</b><small>เดือนนี้</small></div>`;
+}
+
+function viewAct() {
+  return errBanner() + `<div class="stats" id="actCount">${actStatsHtml()}</div>
+  <section class="card"><h2>บันทึก Activate</h2><p class="hint">กรอกครบ รุ่น · IMEI · สี แล้วกดบันทึก = <b>Activated</b> ทันที</p><div id="actForm">${actFormHtml()}</div></section>
+  <section class="card"><h2>สถานะ Activate แยกตามรุ่น</h2><div id="actSum">${actSummaryHtml()}</div></section>
+  <section class="card" style="padding:14px 12px"><h2>รายการ IMEI</h2>
+    <div class="row" style="margin:0 0 10px;flex-wrap:nowrap"><input data-bind="actQ" placeholder="🔍 ค้นหา IMEI / สี / ผู้บันทึก" value="${esc(state.actQ)}" style="margin:0;flex:1"><button data-act="actExport" style="flex:0 0 auto">⬇️ Excel</button></div>
+    <div id="actList">${actRowsHtml()}</div></section>`;
+}
+// อ่านค่าจากฟอร์มเก็บไว้ (กันหายเวลาวาดฟอร์มใหม่)
+function actReadForm() {
+  const f = state.act, g = id => $(id)?.value ?? '';
+  if ($('#actImei')) { f.imei = g('#actImei').trim(); f.model = g('#actModel').trim(); f.color = g('#actColor').trim(); f.note = g('#actNote').trim(); f.auto = !!$('#actAuto')?.checked; }
+  return f;
+}
+const actSetInfo = html => { state.act.info = html; const e = $('#actInfo'); if (e) e.innerHTML = html; };
+async function actLookup(imei) {
+  const f = state.act, done = state.acts.find(a => a.imei === imei);
+  if (done) { actSetInfo(`<p class="act-info err">⚠ IMEI นี้ Activate ไปแล้วเมื่อ ${fmt(done.activated_at)}${done.by_name ? ' โดย ' + esc(done.by_name) : ''} (${esc(done.model)} · ${esc(done.color)})</p>`); return false; }
+  try {
+    const { data } = await sb.rpc('imei_info', { p_imei: imei });
+    if (data?.activated) { actSetInfo(`<p class="act-info err">⚠ IMEI นี้ Activate ไปแล้ว${data.activated_by ? ' โดย ' + esc(data.activated_by) : ''}</p>`); return false; }
+    if (data?.model) {
+      f.model_id = data.model_id; f.model = data.model;
+      const m = $('#actModel'); if (m) m.value = data.model;
+      actSetInfo(`<p class="act-info ok">✓ พบในระบบ: <b>${esc(data.model)}</b></p>`);
+    } else { f.model_id = null; actSetInfo('<p class="act-info">IMEI นี้ไม่อยู่ในสต็อก — กรอกรุ่นเอง</p>'); }
+  } catch { actSetInfo(''); }
+  return true;
+}
+function actScan(raw) {
+  const s = normImei(raw);
+  if (!validImei(s)) return `✗ ${s} ไม่ใช่ IMEI ที่ถูกต้อง (15 หลัก)`;
+  actReadForm(); state.act.imei = s; state.act.model_id = null;
+  const i = $('#actImei'); if (i) i.value = s;
+  actLookup(s).then(ok => { if (ok && state.act.auto) actSave(true); else $('#actColor')?.focus(); });
+  return `✓ ${s}`;
+}
+const actSave = auto => guarded(async () => {
+  const f = actReadForm(), s = normImei(f.imei);
+  if (!s || !validImei(s)) return toast('IMEI ไม่ถูกต้อง', true);
+  if (!f.model) return toast(auto ? 'ไม่พบรุ่นในระบบ — กรอกรุ่นแล้วกดบันทึก' : 'กรุณาระบุรุ่น', true);
+  if (!f.color) return toast('กรุณาระบุสี', true);
+  const m = state.models.find(x => x.name.trim().toLowerCase() === f.model.toLowerCase());
+  await rpc('act_add', { p_imei: s, p_model_id: m ? m.id : null, p_model: f.model, p_color: f.color, p_note: f.note, p_by: opName() });
+  // เตรียมเครื่องถัดไป: ล้าง IMEI/หมายเหตุ เก็บรุ่น+สีไว้
+  Object.assign(state.act, { imei: '', note: '', info: `<p class="act-info ok">✓ Activate ${esc(s)} แล้ว — ยิงเครื่องถัดไปได้เลย</p>` });
+  await loadActs(); renderActs();
+  const fe = $('#actForm'); if (fe) fe.innerHTML = actFormHtml();
+  beep(true); toast(`Activated ${s} · ${f.model} · ${f.color}`);
+  if (!matchMedia('(hover:none)').matches) $('#actImei')?.focus();
+});
+function exportActs() {
+  const H = v => ({ v, s: 1 }), T = v => ({ v, s: 2 });
+  const rows = [[H('วันที่ Activate'), H('รุ่น'), H('IMEI'), H('สี'), H('สถานะ'), H('ผู้บันทึก'), H('หมายเหตุ')],
+    ...state.acts.map(a => [T(new Date(a.activated_at).toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' })), T(a.model), { v: a.imei, s: 3 }, T(a.color), T('Activated'), T(a.by_name), T(a.note)])];
+  downloadBlob(`Activate-${todayISO()}.xlsx`, XL.workbook([{ name: 'Activate', widths: [18, 30, 20, 16, 12, 18, 26], rows, freeze: true }]));
 }
 
 /* ประวัติเอกสาร */
@@ -789,7 +1135,7 @@ function viewNews() {
     ${list.length ? list.map(annCardHtml).join('') : '<div class="empty"><i>📢</i><b>ยังไม่มีประกาศ</b><span>ประกาศเครื่องเข้าใหม่จะแสดงที่นี่</span></div>'}`;
 }
 
-const views = { receive: viewReceive, news: viewNews, request: viewRequest, requests: viewRequests, fulfill: viewFulfill, return: viewReturn, out: viewOut, stock: viewStock, history: viewHistory, settings: viewSettings };
+const views = { act: viewAct, import: viewImport, receive: viewReceive, news: viewNews, request: viewRequest, requests: viewRequests, fulfill: viewFulfill, return: viewReturn, out: viewOut, stock: viewStock, history: viewHistory, settings: viewSettings };
 function render() {
   document.body.classList.toggle('noauth', !state.session);
   if (state.session) fixView();
@@ -809,7 +1155,8 @@ function go(v) {
     else if (v === 'fulfill' && curReq()?.status === 'PENDING') { renderFul(); renderNav(); }
     else if (v === 'return') { refreshReturnInPlace(); renderNav(); }
     else if (v === 'news' && state.annEdit) renderNav();
-    else if (v === 'receive') { renderRcv(); renderNav(); } // ไม่วาดการ์ดรุ่นใหม่ทับ (กันแตะไม่ติด)
+    else if (v === 'receive') { renderRcv(); renderNav(); }
+    else if (v === 'act') { renderActs(); renderNav(); } // ไม่ล้างฟอร์มที่กำลังกรอก // ไม่วาดการ์ดรุ่นใหม่ทับ (กันแตะไม่ติด)
     else render();
   });
 }
@@ -1177,6 +1524,49 @@ const actions = {
   }),
   stockDlg: d => stockDlg(d.id),
   personDlg: d => personDlg(d.p),
+  actSave: () => actSave(false),
+  actPick: d => { state.actM = d.m || ''; renderActs(); $('#actList')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); },
+  actColor: d => { const c = $('#actColor'); if (c) c.value = d.v; state.act.color = d.v; },
+  actExport: () => exportActs(),
+  actDel: d => {
+    if (!confirm(`ลบรายการ Activate ของ ${d.imei}?`)) return;
+    guarded(async () => { await rpc('act_delete', { p_id: +d.id }); await loadActs(); renderActs(); toast('ลบแล้ว'); });
+  },
+  tplQty: d => { const n = Math.max(0, Math.min(2000, (state.tpl[d.id] || 0) + +d.d)); if (n) state.tpl[d.id] = n; else delete state.tpl[d.id]; const i = $(`[data-tpl="${d.id}"]`); if (i) { i.value = n || ''; i.closest('.pick').classList.toggle('on', n > 0); } const t = $('#tplTotal'); if (t) t.textContent = tplTotal(); },
+  tplNewAdd: () => {
+    const name = $('#tpNewName').value.trim(), qty = Math.floor(+$('#tpNewQty').value || 0);
+    if (!name) return toast('ใส่ชื่อรุ่นใหม่', true);
+    if (qty < 1) return toast('ใส่จำนวนเครื่อง', true);
+    if (state.models.some(m => m.name.trim().toLowerCase() === name.toLowerCase())) return toast('รุ่นนี้มีในระบบแล้ว — ใช้ปุ่ม + ด้านบนแทน', true);
+    state.tplNew.push({ name, qty }); renderTpl();
+  },
+  tplNewDel: d => { state.tplNew.splice(+d.i, 1); renderTpl(); },
+  tplExport: () => exportTemplate(),
+  impMode: d => { state.impMode = d.m; document.querySelectorAll('[data-act=impMode]').forEach(b => b.classList.toggle('on', b.dataset.m === d.m)); renderImp(); },
+  impBadExport: () => {
+    const im = state.imp; if (!im) return;
+    const rows = [[{ v: 'แถว', s: 1 }, { v: 'รุ่น', s: 1 }, { v: 'IMEI', s: 1 }, { v: 'ปัญหา', s: 1 }], ...im.problems.map(p => [{ v: p.line, s: 2, n: 1 }, { v: p.model, s: 2 }, { v: p.imei, s: 3 }, { v: p.why, s: 2 }])];
+    downloadBlob(`IMEI-มีปัญหา-${todayISO()}.xlsx`, XL.workbook([{ name: 'มีปัญหา', widths: [8, 30, 22, 50], rows, freeze: true }]));
+  },
+  impCommit: () => guarded(async () => {
+    const im = state.imp; if (!im) return; analyzeImport();
+    if (!im.ok) return toast('ไม่มีรายการที่นำเข้าได้', true);
+    if (im.groups.some(g => g.over)) return toast('โหมดลง IMEI ของเดิม: บางรุ่นเกินจำนวนของเดิม', true);
+    const newOnes = im.groups.filter(g => g.isNew);
+    if (newOnes.length && !confirm(`จะสร้างรุ่นใหม่ ${newOnes.length} รุ่น:\n• ${newOnes.map(g => g.name).join('\n• ')}\n\nยืนยันนำเข้า?`)) return;
+    for (const g of newOnes) { const id = await rpc('model_save', { p_id: null, p_name: g.name, p_active: true, p_stock: 0, p_by: opName() }); g.model = { id, name: g.name, stock: 0 }; }
+    // โหมดลง IMEI ของเดิมใช้กับรุ่นที่เพิ่งสร้างไม่ได้ (ยังไม่มีของเดิม) → รับเข้าใหม่
+    const done = [], fail = [];
+    for (const g of im.groups) {
+      const mode = g.isNew ? 'new' : state.impMode;
+      try { await rpc('stock_receive', { p_model_id: g.model.id, p_imeis: g.imeis, p_mode: mode, p_note: `นำเข้าจากไฟล์ ${im.fileName}`, p_by: opName() }); done.push(`${g.name} ${g.imeis.length}`); }
+      catch (e) { fail.push(`${g.name}: ${errMsg(e)}`); }
+    }
+    state.imp = null; state.tpl = {}; state.tplNew = [];
+    await refresh(); state.view = 'stock'; render();
+    if (fail.length) showDialog(`<h2>นำเข้าเสร็จบางส่วน</h2>${done.length ? `<p>✅ สำเร็จ: ${done.map(esc).join(' · ')}</p>` : ''}<p style="color:var(--red)">❌ ไม่สำเร็จ:<br>${fail.map(esc).join('<br>')}</p><button class="primary big" data-act="closeDlg">ปิด</button>`);
+    else toast(`นำเข้าสต็อกแล้ว ${im.ok} เครื่อง (${done.length} รุ่น)`);
+  }),
   rcvGo: d => { if (d.id && +d.id !== state.rcv.model_id) state.rcv = { model_id: +d.id, mode: 'new', items: [], note: '' }; saveDraft(); go('receive'); },
   rcvModel: d => {
     const id = d.id ? +d.id : null;
@@ -1195,8 +1585,8 @@ const actions = {
     if (!r.items.length) return toast('ยังไม่ได้ยิง IMEI', true);
     const n = r.items.length, name = mName(r.model_id);
     const bal = await rpc('stock_receive', { p_model_id: r.model_id, p_imeis: r.items, p_mode: r.mode, p_note: r.note, p_by: opName() });
-    state.rcv.items = []; state.rcv.note = ''; saveDraft();
-    await refresh(); render(); toast(`${r.mode === 'new' ? 'รับเข้า' : 'ลง IMEI'} ${name} ${n} เครื่องแล้ว · คงเหลือ ${num(bal)}`);
+    state.rcv = { model_id: null, mode: 'new', items: [], note: '' }; saveDraft();
+    await refresh(); state.view = 'stock'; render(); toast(`${r.mode === 'new' ? 'รับเข้า' : 'ลง IMEI'} ${name} ${n} เครื่องแล้ว · คงเหลือ ${num(bal)}`);
   }),
   imeiDlg: d => { state.imeiQ = ''; imeiDlg(d.id); },
   imeiRemove: d => {
@@ -1291,7 +1681,7 @@ const actions = {
   logout: async () => {
     if (!confirm('ออกจากระบบ?')) return;
     await sb.auth.signOut();
-    Object.assign(state, { session: null, role: 'requester', me: { name: '', dept: '', username: '' }, anns: [], annEdit: null, view: '', open: [], openMap: new Map(), docs: [], reqs: [], models: [], modelMap: new Map() });
+    Object.assign(state, { session: null, role: 'requester', me: { name: '', dept: '', username: '' }, anns: [], annEdit: null, acts: [], view: '', open: [], openMap: new Map(), docs: [], reqs: [], models: [], modelMap: new Map() });
     render();
   },
   exportCsv: () => guarded(async () => {
@@ -1304,15 +1694,50 @@ const actions = {
 };
 
 /* ---------- events ---------- */
-document.addEventListener('click', e => {
-  const nav = e.target.closest('[data-view]');
-  if (nav) { go(nav.dataset.view); return; }
-  const a = e.target.closest('[data-act]');
-  if (a) actions[a.dataset.act]?.(a.dataset);
+// ---- การแตะ/คลิก ----
+// จอสัมผัส: ทำงานทันทีตอนยกนิ้ว (ถ้านิ้วไม่ได้ลาก) ไม่รอ click — กันอาการ "กดไม่ติด" ตอนคีย์บอร์ดหุบ/หน้าขยับ/เครื่อง PDA
+// เมาส์/คีย์บอร์ด: ใช้ click ตามปกติ
+const actTarget = el => el && el.closest ? el.closest('[data-view],[data-act]') : null;
+function runTarget(el) {
+  try {
+    if (!el || el.disabled) return;
+    if (el.hasAttribute('data-view')) return go(el.dataset.view);
+    const f = actions[el.dataset.act]; if (f) f(el.dataset);
+  } catch (err) { showError(err); }
+}
+let tap = null, tapDoneAt = 0;
+document.addEventListener('pointerdown', e => {
+  tap = null;
+  if (e.pointerType === 'mouse' || !e.isPrimary) return;
+  const el = actTarget(e.target);
+  if (el && !el.disabled) tap = { el, x: e.clientX, y: e.clientY };
+}, { passive: true });
+document.addEventListener('pointermove', e => { if (tap && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) > 14) tap = null; }, { passive: true });
+document.addEventListener('pointercancel', () => { tap = null; }, { passive: true });
+document.addEventListener('pointerup', e => {
+  const t = tap; tap = null;
+  if (!t || e.pointerType === 'mouse' || Math.hypot(e.clientX - t.x, e.clientY - t.y) > 14) return;
+  tapDoneAt = Date.now(); runTarget(t.el);
 });
+document.addEventListener('click', e => {
+  const el = actTarget(e.target); if (!el) return;
+  if (Date.now() - tapDoneAt < 700) return; // ทำไปแล้วตอนยกนิ้ว
+  runTarget(el);
+});
+// error ที่หลุดจากทุกที่ → แสดงบนจอ (ช่วยหาสาเหตุเวลาใช้งานจริง)
+function showError(err) {
+  const m = err?.message || String(err || 'unknown');
+  console.error(err);
+  try { toast(`เกิดข้อผิดพลาด: ${m} (v${APP_VER})`, true); } catch { }
+}
+addEventListener('error', e => { if (e.error || e.message) showError(e.error || e.message); });
+addEventListener('unhandledrejection', e => showError(e.reason));
 function onBind(e) {
   const t = e.target;
   if (t.dataset.qty) { if (e.type === 'input') setQty(+t.dataset.qty, t.value, false); else setQty(+t.dataset.qty, t.value); return; }
+  if (t.id === 'impFile' && e.type === 'change') { const f = t.files && t.files[0]; t.value = ''; if (f) readImportFile(f); return; }
+  if (t.id === 'impCreate' && e.type === 'change') { state.impCreate = t.checked; renderImp(); return; }
+  if (t.dataset.tpl) { const n = Math.max(0, Math.min(2000, Math.floor(+t.value || 0))); if (n) state.tpl[t.dataset.tpl] = n; else delete state.tpl[t.dataset.tpl]; t.closest('.pick').classList.toggle('on', n > 0); const tt = $('#tplTotal'); if (tt) tt.textContent = tplTotal(); return; }
   if (t.id === 'allowSignup' && e.type === 'change') {
     guarded(async () => { try { await rpc('set_allow_signup', { p_on: t.checked }); state.signupOpen = t.checked; toast(t.checked ? 'เปิดให้สมัครเองแล้ว' : 'ปิดการสมัครเองแล้ว'); } catch (err) { t.checked = !t.checked; throw err; } });
     return;
@@ -1329,6 +1754,7 @@ function onBind(e) {
   else if (b === 'hq' || b === 'ht') renderHistoryList();
   else if (b === 'pq') renderReqList();
   else if (b === 'sq') renderStockList();
+  else if (b === 'actQ') renderActs();
   else if (b === 'rcvQ') { const pl = $('#rcvModels'); if (pl) pl.innerHTML = rcvModelsHtml(); }
   else if (b === 'retQ') { const pl = $('#plist'); if (pl) pl.innerHTML = plistHtml(); }
   else if (b === 'retPerson') {
@@ -1343,7 +1769,7 @@ document.addEventListener('input', onBind);
 document.addEventListener('change', onBind);
 let scanBuf = '', scanT = 0;
 document.addEventListener('keydown', e => {
-  const scanView = state.view === 'return' ? 'return' : state.view === 'fulfill' ? 'ful' : state.view === 'receive' ? 'rcv' : '';
+  const scanView = state.view === 'return' ? 'return' : state.view === 'fulfill' ? 'ful' : state.view === 'receive' ? 'rcv' : state.view === 'act' ? 'act' : '';
   const t = e.target, typing = /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '') || t.isContentEditable;
   if (scanView && !typing && !document.querySelector('dialog[open]') && !e.ctrlKey && !e.metaKey && !e.altKey) {
     const now = Date.now(); if (now - scanT > 400) scanBuf = ''; scanT = now;
@@ -1354,6 +1780,7 @@ document.addEventListener('keydown', e => {
     if (e.key.length === 1 && /[0-9A-Za-z-]/.test(e.key)) scanBuf += e.key;
     return;
   }
+  if (e.key === 'Enter' && t.id === 'actImei') { e.preventDefault(); const v = t.value.trim(); if (v) { const r = actScan(v); if (r.startsWith('✗')) { beep(false); toast(r, true); } } return; }
   if (e.key !== 'Enter' || !t.classList?.contains('wedge')) return;
   e.preventDefault();
   const code = e.target.value.trim(); e.target.value = ''; if (!code) return;

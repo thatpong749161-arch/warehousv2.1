@@ -409,6 +409,68 @@ begin
   return v_n;
 end $$;
 
+-- ───────── Activate เครื่อง (v2.7) — ทุกคนบันทึกได้ · กรอกแล้วถือว่า Activated ─────────
+create table if not exists public.activations (
+  id           bigint generated always as identity primary key,
+  imei         text not null unique,
+  model_id     bigint references public.models(id),
+  model        text not null default '',
+  color        text not null default '',
+  note         text not null default '',
+  status       text not null default 'ACTIVATED' check (status in ('ACTIVATED')),
+  activated_at timestamptz not null default now(),
+  by_name      text not null default '',
+  created_by   uuid default auth.uid()
+);
+create index if not exists activations_time_idx on public.activations(activated_at desc);
+
+-- หารุ่นจาก IMEI (ในสต็อก / ที่ถูกเบิก) — ผู้เบิกเรียกได้ (เห็นแค่รุ่น ไม่เห็นข้อมูลอื่น)
+create or replace function public.imei_info(p_imei text)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'model_id', coalesce(d.model_id, l.model_id),
+    'model', coalesce(m.name, l.model, ''),
+    'in_system', (d.imei is not null or l.imei is not null),
+    'activated', a.activated_at,
+    'activated_by', a.by_name)
+  from (select upper(trim(p_imei)) as imei) q
+  left join devices d on d.imei = q.imei
+  left join lateral (select * from loans where imei = q.imei order by id desc limit 1) l on true
+  left join models m on m.id = coalesce(d.model_id, l.model_id)
+  left join activations a on a.imei = q.imei
+$$;
+
+create or replace function public.act_add(p_imei text, p_model_id bigint, p_model text, p_color text, p_note text, p_by text)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare v_imei text := upper(trim(coalesce(p_imei, ''))); v_model text := trim(coalesce(p_model, '')); v_id bigint; a activations%rowtype;
+begin
+  if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
+  if v_imei !~ '^[A-Z0-9-]{5,30}$' then raise exception 'IMEI ไม่ถูกต้อง'; end if;
+  select * into a from activations where imei = v_imei;
+  if found then
+    raise exception 'IMEI % Activate ไปแล้วเมื่อ % โดย %', v_imei,
+      to_char(a.activated_at at time zone 'Asia/Bangkok', 'DD/MM/YYYY HH24:MI'), coalesce(nullif(a.by_name, ''), '-');
+  end if;
+  if p_model_id is not null then select name into v_model from models where id = p_model_id; end if;
+  if coalesce(v_model, '') = '' then raise exception 'กรุณาระบุรุ่น'; end if;
+  if coalesce(trim(p_color), '') = '' then raise exception 'กรุณาระบุสี'; end if;
+  insert into activations(imei, model_id, model, color, note, by_name)
+  values (v_imei, p_model_id, v_model, trim(p_color), coalesce(trim(p_note), ''), coalesce(trim(p_by), ''))
+  returning id into v_id;
+  return v_id;
+end $$;
+
+-- ลบรายการ (บันทึกผิด): ผู้จ่ายเบิก หรือคนที่บันทึกเอง
+create or replace function public.act_delete(p_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+declare a activations%rowtype;
+begin
+  select * into a from activations where id = p_id;
+  if not found then raise exception 'ไม่พบรายการ'; end if;
+  if not (is_issuer() or a.created_by = auth.uid()) then raise exception 'ลบได้เฉพาะผู้จ่ายเบิก หรือคนที่บันทึกเอง'; end if;
+  delete from activations where id = p_id;
+end $$;
+
 -- ───────── รุ่น / สต็อก (ผู้จ่ายเบิก) ─────────
 create or replace function public.model_save(p_id bigint, p_name text, p_active boolean, p_stock int, p_by text)
 returns bigint language plpgsql security definer set search_path = public as $$
@@ -688,7 +750,7 @@ begin
     truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters restart identity;
     delete from devices where status <> 'IN_STOCK'; -- เก็บเฉพาะเครื่องที่อยู่ในคลัง
   elsif p_scope = 'all' then
-    truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters, devices, models restart identity;
+    truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters, activations, devices, models restart identity;
   else
     raise exception 'ขอบเขตการล้างไม่ถูกต้อง';
   end if;
@@ -711,6 +773,7 @@ alter table public.request_items  enable row level security;
 alter table public.app_settings   enable row level security;
 alter table public.announcements  enable row level security;
 alter table public.devices        enable row level security;
+alter table public.activations    enable row level security;
 
 drop policy if exists "read documents"      on public.documents;
 drop policy if exists "read document_items" on public.document_items;
@@ -722,6 +785,7 @@ drop policy if exists "read requests"       on public.requests;
 drop policy if exists "read request_items"  on public.request_items;
 drop policy if exists "read announcements"  on public.announcements;
 drop policy if exists "read devices"        on public.devices;
+drop policy if exists "read activations"    on public.activations;
 
 -- ผู้จ่ายเบิกเห็นทุกอย่าง · ผู้เบิกเห็นเฉพาะคำขอ/ใบจ่าย/เครื่องของคำขอตัวเอง
 create policy "read profiles" on public.profiles for select to authenticated
@@ -732,6 +796,7 @@ create policy "read announcements" on public.announcements for select to authent
   using (is_issuer() or (active and (show_until is null or show_until >= (now() at time zone 'Asia/Bangkok')::date)));
 create policy "read stock_moves" on public.stock_moves for select to authenticated using (is_issuer());
 create policy "read devices" on public.devices for select to authenticated using (is_issuer());
+create policy "read activations" on public.activations for select to authenticated using (true);
 create policy "read requests" on public.requests for select to authenticated
   using (created_by = auth.uid() or is_issuer());
 create policy "read request_items" on public.request_items for select to authenticated
@@ -786,6 +851,14 @@ revoke all on function public.stock_remove(text[],text,text)                   f
 grant execute on function public.model_avail()                                 to authenticated;
 grant execute on function public.stock_receive(bigint,text[],text,text,text)  to authenticated;
 grant execute on function public.stock_remove(text[],text,text)                to authenticated;
+revoke all on public.activations from anon, authenticated;
+grant select on public.activations to authenticated;
+revoke all on function public.imei_info(text)                                  from public, anon;
+revoke all on function public.act_add(text,bigint,text,text,text,text)         from public, anon;
+revoke all on function public.act_delete(bigint)                               from public, anon;
+grant execute on function public.imei_info(text)                               to authenticated;
+grant execute on function public.act_add(text,bigint,text,text,text,text)      to authenticated;
+grant execute on function public.act_delete(bigint)                            to authenticated;
 revoke all on function public.ann_save(bigint,text,text,text,date,date,boolean,boolean,text) from public, anon;
 revoke all on function public.ann_delete(bigint)                                             from public, anon;
 grant execute on function public.ann_save(bigint,text,text,text,date,date,boolean,boolean,text) to authenticated;
