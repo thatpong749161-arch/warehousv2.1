@@ -428,3 +428,17 @@ body.public .iconbtn,body.public #ticker{display:none!important}
 .ri-item .step input{width:58px;text-align:center;margin:0;padding:6px 4px}
 .ri-item .step button{min-width:34px;padding:6px 0}
 .ri-item>.sm{flex:none;padding:6px 10px}
+
+/* ===== v3.2: ค้างอยู่ — วันที่ / พิมพ์ ===== */
+.out-rows{margin:4px 0 2px}
+.out-r{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:3px 0;border-bottom:1px dashed var(--line)}
+.out-r:last-child{border-bottom:0}
+.out-r .m{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.out-r .d{flex:none;color:var(--mut);font-size:12px;white-space:nowrap}
+.out-r .d.old{color:var(--red,#c0392b);font-weight:600}
+.side .sm+.sm{margin-top:6px}
+td.dcol{white-space:nowrap}
+td.dcol small{display:block}
+.out-r{flex-wrap:wrap;column-gap:8px;row-gap:0}
+.out-r .m{white-space:nowrap}
+.out-r .d{margin-left:auto}

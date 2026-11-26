@@ -5,6 +5,8 @@
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = d => new Date(d).toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' });
+const dShort = d => new Date(d).toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: '2-digit' });
+const dayTxt = n => n === 0 ? 'วันนี้' : n + ' วัน';
 const dtLong = d => d ? new Date(d).toLocaleString('th-TH', { dateStyle: 'long', timeStyle: 'short' }) : '';
 const num = n => Number(n || 0).toLocaleString('th-TH');
 const DOC_T = { ISSUE: 'จ่าย', RETURN: 'คืน' };
@@ -12,9 +14,9 @@ const DOC_CLS = { ISSUE: 'warn', RETURN: 'ok' };
 const REQ_T = { PENDING: 'รอจ่าย', ISSUED: 'จ่ายแล้ว', CANCELLED: 'ยกเลิก' };
 const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
 const MOVE_T = { REG: 'ลง IMEI ของเดิม', SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
-const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก' };
+const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก', viewer: 'ผู้ดู Activate' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '3.0.0';
+const APP_VER = '3.2.0';
 // เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
 const ID_DOMAIN = 'loan.local';
 const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
@@ -61,9 +63,10 @@ const IC = {
 };
 const NAV = {
   requester: [['request', 'ขอเบิก', 'req'], ['requests', 'คำขอของฉัน', 'list'], ['act', 'Activate', 'act'], ['news', 'ประกาศ', 'news']],
+  viewer: [['act', 'Activate', 'act']],
   issuer: [['requests', 'คำขอ', 'list'], ['return', 'รับคืน', 'ret'], ['out', 'ค้างอยู่', 'dev'], ['stock', 'สต็อก', 'box'], ['act', 'Activate', 'act'], ['news', 'ประกาศ', 'news'], ['history', 'ประวัติ', 'hist']]
 };
-const EXTRA = { requester: ['settings'], issuer: ['request', 'fulfill', 'receive', 'import', 'settings'] };
+const EXTRA = { viewer: ['settings'], requester: ['settings'], issuer: ['request', 'fulfill', 'receive', 'import', 'settings'] };
 // ผู้เบิกไม่เห็นเมนู Activate ถ้าตั้งสิทธิ์เป็น “เฉพาะผู้จ่ายเบิก”
 const navList = () => NAV[state.role].filter(([v]) => !(v === 'act' && state.role === 'requester' && state.actAccess === 'issuer'));
 const allowed = v => navList().some(x => x[0] === v) || EXTRA[state.role].includes(v);
@@ -273,7 +276,7 @@ async function loadAppConfig() {
 async function loadRole() {
   const { data, error } = await sb.from('profiles').select('role,name,dept,username').eq('user_id', state.session.user.id).maybeSingle();
   if (error) throw error;
-  state.role = data?.role === 'issuer' ? 'issuer' : 'requester';
+  state.role = ['issuer', 'viewer'].includes(data?.role) ? data.role : 'requester';
   state.me = { name: data?.name || '', dept: data?.dept || '', username: data?.username || showId(state.session.user.email) };
 }
 // จำนวนพร้อมเบิก/ลง IMEI แล้ว ต่อรุ่น (ทุกคน) · รายการ IMEI ในคลัง (ผู้จ่ายเบิก)
@@ -729,14 +732,23 @@ function outGroups() {
   });
   return [...map.values()].filter(g => g.hit).sort((a, b) => new Date(a.oldest) - new Date(b.oldest));
 }
+// รวมตาม รุ่น + วันที่เบิก (วันเดียวกันรวมบรรทัดเดียว)
+function outRowsHtml(g) {
+  const rows = new Map(), day = d => new Date(d).toDateString();
+  g.items.forEach(l => { const k = (l.model || '-') + '|' + day(l.issued_at); const r = rows.get(k) || { m: l.model || '-', at: l.issued_at, c: 0, u: 'เครื่อง' }; r.c++; rows.set(k, r); });
+  (g.its || []).forEach(l => { const k = '🪑' + l.model + '|' + day(l.issued_at); const r = rows.get(k) || { m: '🪑 ' + l.model, at: l.issued_at, c: 0, u: l.unit }; r.c += ilRem(l); rows.set(k, r); });
+  return [...rows.values()].sort((a, b) => new Date(a.at) - new Date(b.at)).map(r => { const n = daysSince(r.at);
+    return `<div class="out-r"><span class="m">${esc(r.m)} <b>×${num(r.c)}</b></span><span class="d ${n >= 7 ? 'old' : ''}">📅 ${dShort(r.at)} · ${dayTxt(n)}</span></div>`; }).join('');
+}
 function outListHtml() {
   const gs = outGroups();
   return gs.length ? gs.map(g => { const n = daysSince(g.oldest); return `<div class="card item doc t-ISSUE" data-act="personDlg" data-p="${esc(g.person)}"><div class="line" style="border:0;padding:0">
     <div class="grow"><b style="font-size:16.5px">${esc(g.person)}</b>${g.dept ? `<small>${esc(g.dept)}</small>` : ''}
-      <small>${[...[...g.models].map(([m, c]) => `${esc(m)} ×${c}`), ...(g.its || []).map(l => `🪑 ${esc(l.model)} ${num(ilRem(l))} ${esc(l.unit)}`)].join(' · ')}</small>
+      <div class="out-rows">${outRowsHtml(g)}</div>
       <small><span class="badge ${n >= 7 ? 'err' : 'warn'}">${n === 0 ? 'วันนี้' : 'นานสุด ' + n + ' วัน'}</span> · ${g.docs.size} ใบจ่าย${g.notes ? ` · <span class="warn-t">มีเหตุผลค้าง ${g.notes}</span>` : ''}</small></div>
     <div class="side"><b class="bignum">${g.items.length || (g.its || []).reduce((a, l) => a + ilRem(l), 0)}</b><small>${g.items.length ? 'เครื่อง' : 'ของใช้'}</small>
-      <button class="primary sm" data-act="retPerson" data-p="${esc(g.person)}">รับคืน</button></div></div></div>`; }).join('')
+      <button class="primary sm" data-act="retPerson" data-p="${esc(g.person)}">รับคืน</button>
+      <button class="sm" data-act="printOut" data-p="${esc(g.person)}" aria-label="พิมพ์รายการค้างของ ${esc(g.person)}">🖨️ พิมพ์</button></div></div></div>`; }).join('')
     : '<div class="empty"><i>✅</i><b>ไม่มีของค้าง</b><span>ทุกรายการคืนครบแล้ว</span></div>';
 }
 const renderOutList = () => { const e = $('#outList'); if (e) e.innerHTML = outListHtml(); };
@@ -744,16 +756,17 @@ function viewOut() {
   const people = new Set([...state.open, ...state.iopen].map(l => l.person)).size, iq = state.iopen.reduce((a, l) => a + ilRem(l), 0);
   return errBanner() + `<input data-bind="outQ" placeholder="ค้นหา ผู้เบิก / IMEI / รุ่น / เลขที่เอกสาร" value="${esc(state.outQ)}" style="margin-bottom:10px">
     <div class="stats"><div><b>${people}</b><small>ผู้เบิก</small></div><div><b>${num(state.open.length)}</b><small>เครื่องค้าง</small></div>${iq ? `<div><b>${num(iq)}</b><small>ของใช้ค้าง</small></div>` : `<div><b>${state.open.filter(l => daysSince(l.issued_at) >= 7).length}</b><small>เกิน 7 วัน</small></div>`}</div>
-    <div class="row"><button data-act="reload">🔄 รีเฟรช</button><button data-act="exportCsv">⬇️ ส่งออก CSV</button></div>
+    <div class="row"><button data-act="reload">🔄 รีเฟรช</button><button data-act="printOut">🖨️ พิมพ์${state.outQ.trim() ? 'ที่ค้นหา' : 'ทั้งหมด'}</button><button data-act="exportCsv">⬇️ CSV</button></div>
     <div id="outList">${outListHtml()}</div>`;
 }
 function personDlg(p) {
   const list = state.open.filter(l => l.person === p), il = state.iopen.filter(l => l.person === p); if (!list.length && !il.length) return;
   showDialog(`<h2>${esc(p)} · ค้าง ${[list.length && list.length + ' เครื่อง', il.length && 'ของใช้ ' + il.length + ' รายการ'].filter(Boolean).join(' · ')}</h2>
-    ${il.length ? `<table style="margin-bottom:10px"><tr><th>ของใช้</th><th class="r">ค้าง</th><th class="r">วัน</th></tr>${il.map(l => `<tr><td class="txt">${esc(l.model)}<small>${esc(l.issue_doc)}${l.last_note ? ` · <span class="warn-t">${esc(l.last_note)}</span>` : ''}</small></td><td class="r">${num(ilRem(l))} ${esc(l.unit)}</td><td class="r">${daysSince(l.issued_at)}</td></tr>`).join('')}</table>` : ''}
-    ${list.length ? `<table><tr><th>IMEI</th><th>รุ่น</th><th class="r">วัน</th></tr>
-    ${list.map(l => `<tr><td>${esc(l.imei)}<small style="font-family:var(--f)">${esc(l.issue_doc)}${l.last_note ? ` · <span class="warn-t">${esc(l.last_note)}</span>` : ''}</small></td><td class="txt">${esc(l.model || '-')}</td><td class="r">${daysSince(l.issued_at)}</td></tr>`).join('')}</table>` : ''}
+    ${il.length ? `<table style="margin-bottom:10px"><tr><th>ของใช้</th><th class="r">ค้าง</th><th class="r">วันที่เบิก</th></tr>${il.map(l => `<tr><td class="txt">${esc(l.model)}<small>${esc(l.issue_doc)}${l.last_note ? ` · <span class="warn-t">${esc(l.last_note)}</span>` : ''}</small></td><td class="r">${num(ilRem(l))} ${esc(l.unit)}</td><td class="r dcol">${dShort(l.issued_at)}<small>${dayTxt(daysSince(l.issued_at))}</small></td></tr>`).join('')}</table>` : ''}
+    ${list.length ? `<table><tr><th>IMEI</th><th>รุ่น</th><th class="r">วันที่เบิก</th></tr>
+    ${[...list].sort((a, b) => new Date(a.issued_at) - new Date(b.issued_at)).map(l => `<tr><td>${esc(l.imei)}<small style="font-family:var(--f)">${esc(l.issue_doc)}${l.last_note ? ` · <span class="warn-t">${esc(l.last_note)}</span>` : ''}</small></td><td class="txt">${esc(l.model || '-')}</td><td class="r dcol">${dShort(l.issued_at)}<small class="${daysSince(l.issued_at) >= 7 ? 'warn-t' : ''}">${dayTxt(daysSince(l.issued_at))}</small></td></tr>`).join('')}</table>` : ''}
     <button class="primary big" data-act="retPerson" data-p="${esc(p)}">รับคืนจากคนนี้</button>
+    <button class="big" data-act="printOut" data-p="${esc(p)}">🖨️ พิมพ์รายการค้างของคนนี้</button>
     <button class="big" data-act="closeDlg">ปิด</button>`);
 }
 
@@ -1000,7 +1013,8 @@ async function readImportFile(file) {
 
 /* ---------- Activate ---------- */
 const actMine = a => a.created_by === state.session?.user?.id;
-const canEditAct = a => !state.pub && (isIssuer() || (actMine(a) && state.actAccess !== 'issuer'));
+const isViewer = () => state.role === 'viewer';
+const canEditAct = a => !state.pub && !isViewer() && (isIssuer() || (actMine(a) && state.actAccess !== 'issuer'));
 function actEditDlg(id) {
   const a = state.acts.find(x => x.id === +id); if (!a) return;
   showDialog(`<h2>แก้ไข Activate</h2><p class="code" style="font-size:15px;margin-bottom:10px">${esc(a.imei)}</p>
@@ -1089,7 +1103,7 @@ async function loadActShare() {
 function viewAct() {
   if (isIssuer() && state.actShare == null) setTimeout(loadActShare, 0);
   return errBanner() + `<div class="stats" id="actCount">${actStatsHtml()}</div>
-  <section class="card"><h2>บันทึก Activate</h2><p class="hint">กรอกครบ รุ่น · IMEI · สี แล้วกดบันทึก = <b>Activated</b> ทันที</p><div id="actForm">${actFormHtml()}</div></section>
+  ${isViewer() ? '<p class="act-info" style="margin:0 0 12px">👁 บัญชีนี้ดูได้อย่างเดียว</p>' : `<section class="card"><h2>บันทึก Activate</h2><p class="hint">กรอกครบ รุ่น · IMEI · สี แล้วกดบันทึก = <b>Activated</b> ทันที</p><div id="actForm">${actFormHtml()}</div></section>`}
   <section class="card"><h2>สถานะ Activate แยกตามรุ่น</h2><div id="actSum">${actSummaryHtml()}</div></section>
   ${isIssuer() ? `<details class="card act-admin" ${state.actShare?.on ? 'open' : ''}><summary><b>🔒 สิทธิ์การดู & ลิงก์แชร์</b></summary><div id="actAdmin">${actAdminHtml()}</div></details>` : ''}
   <section class="card" style="padding:14px 12px"><h2>รายการ IMEI</h2>
@@ -1577,7 +1591,10 @@ tr.grp td span{color:var(--mut);font-weight:500}
 .miss .mh{font-weight:700;font-size:12px}.miss .mh span{font-weight:500;color:var(--mut);margin-left:6px}
 .miss .mi{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:4px;font-size:11px}
 .miss .mi span{font-family:"IBM Plex Mono",monospace}
-.miss.sold{border-color:#9dbbe0;background:#eef4fb}`;
+.miss.sold{border-color:#9dbbe0;background:#eef4fb}
+.op{margin-top:14px;break-inside:auto}
+.op .gh{display:flex;align-items:baseline;gap:10px;padding:6px 2px;border-bottom:2px solid var(--ink);margin-bottom:4px;break-after:avoid}
+.op .gh b{font-size:14px}.op .gh .dp{color:var(--mut);font-size:11.5px}.op .gh span:last-child{margin-left:auto;font-size:11px;color:var(--mut)}`;
 function openWin() {
   const w = window.open('', '_blank');
   if (!w) { toast('เบราว์เซอร์บล็อกหน้าต่างพิมพ์', true); return null; }
@@ -1593,6 +1610,41 @@ function writePrint(w, no, body) {
   <style>${PRINT_CSS}@page{@bottom-left{content:"${safe}  ·  ${stamp}";font:9.5px "IBM Plex Sans Thai",sans-serif;color:#4a5560}}</style></head><body>${body}
   <script>(document.fonts&&document.fonts.ready?document.fonts.ready:Promise.resolve()).then(()=>setTimeout(()=>print(),300));<\/script></body></html>`);
   w.document.close();
+}
+// พิมพ์รายการค้างคืน: p = คนเดียว · ไม่ใส่ = ทุกคน (ตามที่ค้นหาอยู่)
+function printOut(p) {
+  const gs = outGroups().filter(g => !p || g.person === p);
+  if (!gs.length) return toast('ไม่มีรายการค้าง', true);
+  const w = openWin(); if (!w) return;
+  const now = new Date(), no = 'OUT-' + now.toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' }).slice(2).replace(/-/g, '');
+  const dFull = d => new Date(d).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: '2-digit' });
+  const dv = gs.reduce((a, g) => a + g.items.length, 0), iq = gs.reduce((a, g) => a + (g.its || []).reduce((x, l) => x + ilRem(l), 0), 0);
+  const tot = [dv && `${num(dv)} เครื่อง`, iq && `ของใช้ ${num(iq)} ชิ้น`].filter(Boolean).join(' · ');
+  const person = g => {
+    const devs = [...g.items].sort((a, b) => new Date(a.issued_at) - new Date(b.issued_at) || (a.model || '').localeCompare(b.model || '', 'th'));
+    const its = [...(g.its || [])].sort((a, b) => new Date(a.issued_at) - new Date(b.issued_at));
+    const dTbl = devs.length ? `<table><thead><tr><th class="n">#</th><th style="width:25%">IMEI / S/N</th><th>รุ่น</th><th style="width:12%">วันที่เบิก</th><th style="width:8%;text-align:right">ค้าง</th><th style="width:16%">ใบจ่าย</th><th style="width:20%">หมายเหตุ</th></tr></thead><tbody>
+      ${devs.map((l, k) => { const n = daysSince(l.issued_at); return `<tr><td class="n">${String(k + 1).padStart(2, '0')}</td><td class="imei">${esc(imeiFmt(l.imei))}</td><td>${esc(l.model || '-')}</td><td>${dFull(l.issued_at)}</td><td style="text-align:right;${n >= 7 ? 'font-weight:700' : ''}">${n} วัน</td><td class="mono" style="font-size:10.5px">${esc(l.issue_doc)}</td><td style="font-size:10.5px">${esc(l.last_note || '')}</td></tr>`; }).join('')}</tbody></table>` : '';
+    const iTbl = its.length ? `<table style="margin-top:${devs.length ? 8 : 0}px"><thead><tr><th class="n">#</th><th>ของใช้ / อุปกรณ์</th><th style="width:13%;text-align:right">ค้าง</th><th style="width:12%">วันที่เบิก</th><th style="width:8%;text-align:right">นาน</th><th style="width:16%">ใบจ่าย</th><th style="width:20%">หมายเหตุ</th></tr></thead><tbody>
+      ${its.map((l, k) => `<tr><td class="n">${String(k + 1).padStart(2, '0')}</td><td>${esc(l.model)}</td><td style="text-align:right;font-weight:700">${num(ilRem(l))} ${esc(l.unit)}</td><td>${dFull(l.issued_at)}</td><td style="text-align:right">${daysSince(l.issued_at)} วัน</td><td class="mono" style="font-size:10.5px">${esc(l.issue_doc)}</td><td style="font-size:10.5px">${esc(l.last_note || '')}</td></tr>`).join('')}</tbody></table>` : '';
+    const sub = [g.items.length && `${g.items.length} เครื่อง`, its.length && `ของใช้ ${num(its.reduce((a, l) => a + ilRem(l), 0))} ชิ้น`].filter(Boolean).join(' · ');
+    return { devs, its, sub, html: dTbl + iTbl };
+  };
+  let body;
+  if (p) {
+    const g = gs[0], x = person(g);
+    body = `<section>${sheetHead({ title: 'รายการค้างคืน', en: 'Outstanding Items', no, sub: `${esc(g.person)} · ${x.sub}` })}
+      ${metaGrid([['ผู้เบิก', esc(g.person)], ['แผนก/งาน', esc(g.dept || '')], ['ข้อมูล ณ วันที่', esc(now.toLocaleString('th-TH', { dateStyle: 'medium', timeStyle: 'short' }))], ['เบิกนานสุด', `${daysSince(g.oldest)} วัน (ตั้งแต่ ${dFull(g.oldest)})`], ['ใบจ่ายที่เกี่ยวข้อง', esc([...g.docs].join(', ')), 2]], 3)}
+      <div style="margin-top:12px">${x.html}</div>
+      <div class="total"><span>ค้างรวม<b>${g.items.length || num(x.its.reduce((a, l) => a + ilRem(l), 0))}</b>${g.items.length ? 'เครื่อง' : 'ชิ้น'}${g.items.length && x.its.length ? ` · ของใช้ ${num(x.its.reduce((a, l) => a + ilRem(l), 0))} ชิ้น` : ''}</span></div>
+      ${signBox('ผู้เบิก (รับทราบรายการค้าง)', 'ผู้จ่ายเบิก')}</section>`;
+  } else {
+    body = `<section>${sheetHead({ title: 'รายงานรายการค้างคืน', en: 'Outstanding Report', no, sub: `${gs.length} คน · ${tot}${state.outQ.trim() ? ` · ค้นหา “${esc(state.outQ.trim())}”` : ''}` })}
+      ${metaGrid([['ข้อมูล ณ วันที่', esc(now.toLocaleString('th-TH', { dateStyle: 'medium', timeStyle: 'short' }))], ['ผู้เบิกที่ค้าง', gs.length + ' คน'], ['ค้างเกิน 7 วัน', gs.filter(g => daysSince(g.oldest) >= 7).length + ' คน']], 3)}
+      ${gs.map(g => { const x = person(g), n = daysSince(g.oldest); return `<div class="op"><div class="gh"><b>${esc(g.person)}</b>${g.dept ? `<span class="dp">${esc(g.dept)}</span>` : ''}<span>${x.sub} · นานสุด ${n} วัน</span></div>${x.html}</div>`; }).join('')}
+      <div class="total"><span>ค้างรวมทั้งสิ้น ${gs.length} คน ·<b>${num(dv || iq)}</b>${dv ? 'เครื่อง' : 'ชิ้น'}${dv && iq ? ` · ของใช้ ${num(iq)} ชิ้น` : ''}</span></div></section>`;
+  }
+  writePrint(w, no, body);
 }
 function printReq(no) {
   const r = state.reqs.find(x => x.req_no === no); if (!r) return;
@@ -1679,6 +1731,7 @@ const actions = {
     if (v) state.retItems[l.id] = v; else delete state.retItems[l.id]; saveDraft(); renderRet(); },
   fulQ: d => { const r = curReq(), l = r?.request_items.find(x => x.model_id === +d.id); if (!l) return; const cur = state.ful.qty[l.model_id] || 0;
     state.ful.qty[l.model_id] = d.d === 'all' ? (cur >= l.qty ? 0 : l.qty) : Math.max(0, Math.min(l.qty, cur + +d.d)); saveDraft(); renderFul(); },
+  printOut: d => printOut(d.p),
   pickPerson: d => { if (state.retPerson !== d.p) { state.retPerson = d.p; state.cart.return = []; state.retItems = {}; saveDraft(); } renderRetAll(); },
   retClear: () => {
     if (state.cart.return.length && !confirm(`ยิงไปแล้ว ${state.cart.return.length} เครื่อง — เปลี่ยนผู้เบิกจะล้างรายการที่ยิงไว้`)) return;

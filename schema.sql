@@ -199,12 +199,22 @@ begin
   update profiles set name = coalesce(trim(p_name), ''), dept = coalesce(trim(p_dept), '') where user_id = auth.uid();
 end $$;
 
+-- v3.1 บัญชี “ผู้ดู Activate” (viewer): เห็นเฉพาะเมนู Activate ดูอย่างเดียว
+alter table public.profiles drop constraint if exists profiles_role_check;
+alter table public.profiles add constraint profiles_role_check check (role in ('requester','issuer','viewer'));
+create or replace function public.is_viewer()
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from profiles where user_id = auth.uid() and role = 'viewer')
+$$;
+revoke all on function public.is_viewer() from public, anon;
+grant execute on function public.is_viewer() to authenticated;
+
 create or replace function public.set_role(p_user uuid, p_role text)
 returns void language plpgsql security definer set search_path = public as $$
 begin
   if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
   if p_user = auth.uid() then raise exception 'เปลี่ยนสิทธิ์ของตัวเองไม่ได้'; end if;
-  if p_role not in ('requester','issuer') then raise exception 'สิทธิ์ไม่ถูกต้อง'; end if;
+  if p_role not in ('requester','issuer','viewer') then raise exception 'สิทธิ์ไม่ถูกต้อง'; end if;
   update profiles set role = p_role where user_id = p_user;
 end $$;
 
@@ -252,9 +262,9 @@ begin
   if v_u !~ '^[a-z0-9._-]{3,30}$' then raise exception 'ID ต้องเป็นตัวอังกฤษพิมพ์เล็ก/ตัวเลข/จุด/ขีด 3–30 ตัว'; end if;
   if length(coalesce(p_password, '')) < 6 then raise exception 'รหัสผ่านอย่างน้อย 6 ตัว'; end if;
   if coalesce(trim(p_name), '') = '' then raise exception 'กรุณาใส่ชื่อ-นามสกุล'; end if;
-  if v_role not in ('requester','issuer') then raise exception 'สิทธิ์ไม่ถูกต้อง'; end if;
+  if v_role not in ('requester','issuer','viewer') then raise exception 'สิทธิ์ไม่ถูกต้อง'; end if;
   if not v_issuer then
-    if v_role <> 'requester' then raise exception 'ไม่มีสิทธิ์สร้างผู้จ่ายเบิก'; end if;
+    if v_role <> 'requester' then raise exception 'ไม่มีสิทธิ์สร้างบัญชีประเภทนี้'; end if;
     if coalesce((select value from app_settings where key = 'allow_signup'), 'true'::jsonb) <> 'true'::jsonb then
       raise exception 'ระบบปิดการสมัครเองอยู่ — ขอบัญชีจากผู้จ่ายเบิก';
     end if;
@@ -548,6 +558,7 @@ returns bigint language plpgsql security definer set search_path = public as $$
 declare v_imei text := upper(trim(coalesce(p_imei, ''))); v_model text := trim(coalesce(p_model, '')); v_id bigint; a activations%rowtype;
 begin
   if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
+  if is_viewer() then raise exception 'บัญชีผู้ดู Activate ดูได้อย่างเดียว'; end if;
   if act_access() = 'issuer' and not is_issuer() then raise exception 'การ Activate เปิดให้เฉพาะผู้จ่ายเบิก'; end if;
   if v_imei !~ '^[A-Z0-9-]{5,30}$' then raise exception 'IMEI ไม่ถูกต้อง'; end if;
   if p_at is not null and p_at > now() + interval '10 minutes' then raise exception 'วันที่ Activate อยู่ในอนาคตไม่ได้'; end if;
@@ -572,7 +583,7 @@ declare a activations%rowtype; v_model text := trim(coalesce(p_model, ''));
 begin
   select * into a from activations where id = p_id for update;
   if not found then raise exception 'ไม่พบรายการ'; end if;
-  if not (is_issuer() or (a.created_by = auth.uid() and act_access() <> 'issuer')) then raise exception 'แก้ได้เฉพาะผู้จ่ายเบิก หรือคนที่บันทึกเอง'; end if;
+  if not (is_issuer() or (a.created_by = auth.uid() and act_access() <> 'issuer' and not is_viewer())) then raise exception 'แก้ได้เฉพาะผู้จ่ายเบิก หรือคนที่บันทึกเอง'; end if;
   if p_at is null then raise exception 'กรุณาระบุวันที่'; end if;
   if p_at > now() + interval '10 minutes' then raise exception 'วันที่ Activate อยู่ในอนาคตไม่ได้'; end if;
   if p_model_id is not null then select name into v_model from models where id = p_model_id; end if;
@@ -589,7 +600,7 @@ declare v_n int;
 begin
   if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
   if cardinality(coalesce(p_ids, '{}')) = 0 then raise exception 'ยังไม่ได้เลือกรายการ'; end if;
-  if not is_issuer() and (act_access() = 'issuer' or exists (select 1 from activations where id = any(p_ids) and created_by is distinct from auth.uid())) then
+  if not is_issuer() and (act_access() = 'issuer' or is_viewer() or exists (select 1 from activations where id = any(p_ids) and created_by is distinct from auth.uid())) then
     raise exception 'ลบได้เฉพาะรายการที่คุณบันทึกเอง';
   end if;
   delete from activations where id = any(p_ids);
@@ -638,7 +649,7 @@ declare a activations%rowtype;
 begin
   select * into a from activations where id = p_id;
   if not found then raise exception 'ไม่พบรายการ'; end if;
-  if not (is_issuer() or (a.created_by = auth.uid() and act_access() <> 'issuer')) then raise exception 'ลบได้เฉพาะผู้จ่ายเบิก หรือคนที่บันทึกเอง'; end if;
+  if not (is_issuer() or (a.created_by = auth.uid() and act_access() <> 'issuer' and not is_viewer())) then raise exception 'ลบได้เฉพาะผู้จ่ายเบิก หรือคนที่บันทึกเอง'; end if;
   delete from activations where id = p_id;
 end $$;
 
@@ -717,6 +728,7 @@ returns text language plpgsql security definer set search_path = public as $$
 declare v_no text; it jsonb; m models%rowtype; q int; rec record; v_av int;
 begin
   if auth.uid() is null then raise exception 'ต้องเข้าสู่ระบบก่อน'; end if;
+  if is_viewer() then raise exception 'บัญชีผู้ดู Activate ขอเบิกไม่ได้'; end if;
   if coalesce(trim(p_person), '') = '' then raise exception 'กรุณาระบุผู้เบิก'; end if;
   if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
     raise exception 'ยังไม่ได้เลือกรุ่น';
@@ -1048,7 +1060,7 @@ create policy "read announcements" on public.announcements for select to authent
 create policy "read stock_moves" on public.stock_moves for select to authenticated using (is_issuer());
 create policy "read devices" on public.devices for select to authenticated using (is_issuer());
 create policy "read activations" on public.activations for select to authenticated
-  using (is_issuer() or act_access() = 'all' or (act_access() = 'own' and created_by = auth.uid()));
+  using (is_issuer() or is_viewer() or act_access() = 'all' or (act_access() = 'own' and created_by = auth.uid()));
 create policy "read requests" on public.requests for select to authenticated
   using (created_by = auth.uid() or is_issuer());
 create policy "read request_items" on public.request_items for select to authenticated
