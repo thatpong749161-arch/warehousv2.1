@@ -628,18 +628,70 @@ begin
   insert into app_settings(key, value) values ('act_share', cur) on conflict (key) do update set value = excluded.value;
   return cur;
 end $$;
--- ใครก็เรียกได้ (ไม่ต้องล็อกอิน) แต่ต้องมีรหัสลิงก์ที่ถูกต้องและเปิดใช้งานอยู่
+-- v3.3 ลิงก์แชร์หลายลิงก์ แยกตามยี่ห้อ — keywords = คำที่อยู่ในชื่อรุ่น (ไม่ใส่ = ทุกยี่ห้อ)
+create table if not exists public.act_shares (
+  id         bigint generated always as identity primary key,
+  name       text not null,
+  keywords   text[] not null default '{}',
+  token      text not null unique,
+  is_on      boolean not null default true,
+  created_at timestamptz not null default now()
+);
+alter table public.act_shares enable row level security;
+revoke all on public.act_shares from anon, authenticated;
+-- ย้ายลิงก์เดิม (v2.8) มาเป็น “ทุกยี่ห้อ” — ลิงก์ที่ส่งไปแล้วใช้ต่อได้
+insert into public.act_shares(name, keywords, token, is_on)
+select 'ทุกยี่ห้อ', '{}', value->>'token', coalesce((value->>'on')::boolean, false)
+from public.app_settings where key = 'act_share' and coalesce(value->>'token', '') <> ''
+  and not exists (select 1 from public.act_shares x where x.token = app_settings.value->>'token');
+
+create or replace function public.act_share_match(p_model text, p_kw text[])
+returns boolean language sql immutable as $$
+  select cardinality(coalesce(p_kw, '{}')) = 0
+      or exists (select 1 from unnest(p_kw) k where trim(k) <> '' and lower(p_model) like '%' || lower(trim(k)) || '%')
+$$;
+create or replace function public.act_share_list()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  return coalesce((select jsonb_agg(jsonb_build_object('id', s.id, 'name', s.name, 'keywords', s.keywords, 'token', s.token, 'on', s.is_on,
+           'count', (select count(*) from activations a where act_share_match(a.model, s.keywords))) order by s.id) from act_shares s), '[]');
+end $$;
+-- p_id null = สร้างใหม่ · p_new = สร้างรหัสลิงก์ใหม่ (ลิงก์เก่าใช้ไม่ได้)
+create or replace function public.act_share_save(p_id bigint, p_name text, p_keywords text[], p_on boolean, p_new boolean default false)
+returns bigint language plpgsql security definer set search_path = public, extensions as $$
+declare v_id bigint; v_kw text[]; v_tok text := translate(encode(gen_random_bytes(18), 'base64'), '+/=', '-_');
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  if coalesce(trim(p_name), '') = '' then raise exception 'กรุณาตั้งชื่อลิงก์'; end if;
+  select coalesce(array_agg(distinct trim(k)) filter (where trim(k) <> ''), '{}') into v_kw from unnest(coalesce(p_keywords, '{}')) k;
+  if p_id is null then
+    insert into act_shares(name, keywords, token, is_on) values (trim(p_name), v_kw, v_tok, coalesce(p_on, true)) returning id into v_id;
+  else
+    update act_shares set name = trim(p_name), keywords = v_kw, is_on = coalesce(p_on, is_on),
+      token = case when coalesce(p_new, false) then v_tok else token end where id = p_id returning id into v_id;
+    if v_id is null then raise exception 'ไม่พบลิงก์'; end if;
+  end if;
+  return v_id;
+end $$;
+create or replace function public.act_share_delete(p_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  delete from act_shares where id = p_id;
+end $$;
+
+-- ใครก็เรียกได้ (ไม่ต้องล็อกอิน) แต่ต้องมีรหัสลิงก์ที่ถูกต้องและเปิดใช้งานอยู่ — เห็นเฉพาะยี่ห้อของลิงก์นั้น
 create or replace function public.act_public(p_token text)
 returns jsonb language plpgsql stable security definer set search_path = public as $$
-declare cur jsonb := (select value from app_settings where key = 'act_share');
+declare sh act_shares%rowtype;
 begin
-  if cur is null or not coalesce((cur->>'on')::boolean, false) or coalesce(cur->>'token', '') = ''
-     or length(coalesce(p_token, '')) < 16 or p_token <> cur->>'token' then
-    return jsonb_build_object('ok', false);
-  end if;
-  return jsonb_build_object('ok', true, 'at', now(), 'items', coalesce((
+  if length(coalesce(p_token, '')) < 16 then return jsonb_build_object('ok', false); end if;
+  select * into sh from act_shares where token = p_token and is_on;
+  if not found then return jsonb_build_object('ok', false); end if;
+  return jsonb_build_object('ok', true, 'at', now(), 'name', sh.name, 'items', coalesce((
     select jsonb_agg(jsonb_build_object('imei', imei, 'model', model, 'color', color, 'activated_at', activated_at, 'status', status, 'by_name', by_name)
-                     order by activated_at desc, id desc) from activations), '[]'::jsonb));
+                     order by activated_at desc, id desc) from activations where act_share_match(model, sh.keywords)), '[]'::jsonb));
 end $$;
 
 -- ลบรายการ (บันทึกผิด): ผู้จ่ายเบิก หรือคนที่บันทึกเอง
@@ -1133,6 +1185,12 @@ revoke all on function public.act_set_access(text)                             f
 revoke all on function public.act_share_get()                                  from public, anon;
 revoke all on function public.act_share_set(boolean,boolean)                   from public, anon;
 revoke all on function public.act_public(text)                                 from public;
+revoke all on function public.act_share_list()                                 from public, anon;
+revoke all on function public.act_share_save(bigint,text,text[],boolean,boolean) from public, anon;
+revoke all on function public.act_share_delete(bigint)                         from public, anon;
+grant execute on function public.act_share_list()                              to authenticated;
+grant execute on function public.act_share_save(bigint,text,text[],boolean,boolean) to authenticated;
+grant execute on function public.act_share_delete(bigint)                      to authenticated;
 revoke all on function public.act_delete_many(bigint[])                        from public, anon;
 revoke all on function public.dev_edit(text,text,bigint,text)                  from public, anon;
 revoke all on function public.dev_delete(text[],boolean,text)                  from public, anon;

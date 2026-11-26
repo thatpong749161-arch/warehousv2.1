@@ -16,7 +16,7 @@ const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
 const MOVE_T = { REG: 'ลง IMEI ของเดิม', SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก', viewer: 'ผู้ดู Activate' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '3.2.2';
+const APP_VER = '3.3.0';
 // เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
 const ID_DOMAIN = 'loan.local';
 const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
@@ -33,7 +33,7 @@ const sb = configured ? window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPAB
 const state = {
   view: '', session: null, role: 'requester', me: { name: '', dept: '', username: '' }, authTab: 'login', signupOpen: true, operator: '', busy: false, loadErr: '',
   models: [], modelMap: new Map(), reqs: [], reqLimit: 200, anns: [], annEdit: null,
-  acts: [], actQ: '', actM: '', actAccess: 'all', actShare: null, actAt: '', pub: null, actSel: null, imeiSel: new Set(), devDel: null, act: { imei: '', model_id: null, model: '', color: '', note: '', info: '', auto: false },
+  acts: [], actQ: '', actM: '', actAccess: 'all', actShare: null, actAt: '', pub: null, actSel: null, actShares: null, imeiSel: new Set(), devDel: null, act: { imei: '', model_id: null, model: '', color: '', note: '', info: '', auto: false },
   avail: new Map(), devMap: new Map(), tpl: {}, tplNew: [], imp: null, impMode: 'new', impCreate: true, rcv: { model_id: null, mode: 'new', items: [], note: '' }, rcvQ: '', imeiQ: '',
   open: [], openMap: new Map(), docs: [], docsLimit: 300,
   req: { person: '', dept: '', purpose: '', note: '', qty: {} },
@@ -1086,27 +1086,54 @@ function actStatsHtml() {
   return `<div><b>${num(state.acts.length)}</b><small>Activate ทั้งหมด</small></div><div><b>${num(state.acts.filter(a => d(a) === today).length)}</b><small>วันนี้</small></div><div><b>${num(state.acts.filter(a => d(a).startsWith(month)).length)}</b><small>เดือนนี้</small></div>`;
 }
 
+const shareUrl = t => `${location.origin}${location.pathname.replace(/index\.html$/, '')}?share=${t}`;
+const kwMatch = (model, kw) => !kw?.length || kw.some(k => k.trim() && String(model || '').toLowerCase().includes(k.trim().toLowerCase()));
 function actAdminHtml() {
-  const sh = state.actShare, link = sh?.token ? `${location.origin}${location.pathname.replace(/index\.html$/, '')}?share=${sh.token}` : '';
-  const A = [['all', 'ทุกคนเห็นทั้งหมด'], ['own', 'ผู้เบิกเห็นเฉพาะของตัวเอง'], ['issuer', 'เฉพาะผู้จ่ายเบิก']];
+  const A = [['all', 'ทุกคนเห็นทั้งหมด'], ['own', 'ผู้เบิกเห็นเฉพาะของตัวเอง'], ['issuer', 'เฉพาะผู้จ่ายเบิก']], L = state.actShares;
   return `<p class="hint" style="margin-top:10px">ใครเห็นเมนู Activate ในแอป (ผู้จ่ายเบิกเห็นทั้งหมดเสมอ)</p>
     <div class="seg seg3">${A.map(([k, t]) => `<button data-act="actAccess" data-m="${k}" class="${state.actAccess === k ? 'on' : ''}">${t}</button>`).join('')}</div>
-    <p class="hint" style="margin-top:14px">ลิงก์ลับสำหรับดูตาราง Activate <b>โดยไม่ต้องล็อกอิน</b> (ดูอย่างเดียว · แสดงรุ่น IMEI วันที่ สี สถานะ ผู้ลงข้อมูล) — ใครมีลิงก์ก็เปิดดูได้ จนกว่าจะปิดหรือสร้างลิงก์ใหม่</p>
-    ${sh == null ? '<p class="muted">กำลังโหลด...</p>' : `<label class="chk"><input type="checkbox" id="actShareOn" ${sh.on ? 'checked' : ''}> เปิดใช้ลิงก์ดูตาราง</label>
-    ${sh.on && link ? `<div class="share-box"><input id="shareLink" readonly value="${esc(link)}"><button class="primary" data-act="shareCopy">📋 คัดลอก</button></div>
-      <div class="row" style="margin:8px 0 0"><button data-act="shareOpen">↗ เปิดดู</button><button class="danger" data-act="shareNew">🔄 สร้างลิงก์ใหม่ (ลิงก์เก่าใช้ไม่ได้)</button></div>` : ''}`}`;
+    <p class="hint" style="margin-top:14px">ลิงก์ดูตาราง Activate <b>โดยไม่ต้องล็อกอิน</b> — สร้างได้หลายลิงก์ แยกตามยี่ห้อ · ใครมีลิงก์ก็เปิดดูได้ (ดูอย่างเดียว) จนกว่าจะปิด / สร้างรหัสใหม่ / ลบ</p>
+    ${L == null ? '<p class="muted">กำลังโหลด...</p>' : L.map(x => `<div class="sh-card ${x.on ? '' : 'off'}">
+      <div class="sh-top"><b>🔗 ${esc(x.name)}</b><span class="badge ${x.on ? 'ok' : ''}">${x.on ? 'เปิดอยู่' : 'ปิด'}</span></div>
+      <small class="muted">${x.keywords.length ? 'รุ่นที่มีคำว่า: ' + x.keywords.map(k => `<span class="kw">${esc(k)}</span>`).join(' ') : 'ทุกยี่ห้อ'} · ${num(x.count)} เครื่อง</small>
+      ${x.on ? `<div class="share-box"><input readonly value="${esc(shareUrl(x.token))}" id="shl-${x.id}"><button class="primary" data-act="shCopy" data-id="${x.id}">📋 คัดลอก</button></div>` : ''}
+      <div class="sh-btns">${x.on ? `<button data-act="shOpen" data-id="${x.id}">↗ เปิดดู</button>` : ''}<button data-act="shToggle" data-id="${x.id}">${x.on ? '⏸ ปิด' : '▶ เปิด'}</button><button data-act="shEdit" data-id="${x.id}">✎ แก้ไข</button></div></div>`).join('')}
+    <button class="primary big" data-act="shEdit" style="margin-top:8px">＋ สร้างลิงก์ใหม่</button>`;
 }
+const shCntTxt = () => state.actShares?.length ? ` (${state.actShares.filter(x => x.on).length} ลิงก์เปิดอยู่)` : '';
 async function loadActShare() {
   if (!isIssuer()) return;
-  try { state.actShare = await rpc('act_share_get', {}); } catch { state.actShare = { on: false, token: '' }; }
+  try { state.actShares = await rpc('act_share_list', {}); } catch { state.actShares = []; }
   const e = $('#actAdmin'); if (e) e.innerHTML = actAdminHtml();
+  const c = $('#shCnt'); if (c) c.textContent = shCntTxt();
+}
+// คำแนะนำยี่ห้อ = คำแรกของชื่อรุ่น
+const brandHints = () => [...new Set([...devModels().map(m => m.name), ...state.acts.map(a => a.model)].map(n => String(n || '').trim().split(/\s+/)[0]).filter(w => w && w.length > 1))].sort((a, b) => a.localeCompare(b, 'th')).slice(0, 24);
+function shEditDlg(id) {
+  const x = id ? state.actShares.find(v => v.id === +id) : { name: '', keywords: [], on: true };
+  showDialog(`<h2>${id ? 'แก้ไขลิงก์' : 'สร้างลิงก์ใหม่'}</h2>
+    <label>ชื่อลิงก์ (เห็นบนหน้าที่เปิด)<input id="shName" value="${esc(x.name)}" placeholder="เช่น Samsung, iPhone, OPPO"></label>
+    <label>คำในชื่อรุ่น (คั่นด้วย ,) <small style="display:inline">— เว้นว่าง = ทุกยี่ห้อ</small><input id="shKw" value="${esc(x.keywords.join(', '))}" placeholder="เช่น Samsung, Galaxy"></label>
+    <div class="chips" style="margin:-4px 0 6px">${brandHints().map(w => `<button class="rchip" data-act="shKwAdd" data-v="${esc(w)}">+ ${esc(w)}</button>`).join('')}</div>
+    <div id="shPrev" class="act-info" style="margin:6px 0 12px"></div>
+    <button class="primary big" data-act="shSave" data-id="${id || ''}" style="margin-top:0">${id ? 'บันทึก' : 'สร้างลิงก์'}</button>
+    ${id ? `<div class="row" style="margin:10px 0 0"><button data-act="shRegen" data-id="${id}">🔄 สร้างรหัสใหม่<br><small>ลิงก์เก่าใช้ไม่ได้</small></button><button class="danger" data-act="shDel" data-id="${id}">🗑 ลบลิงก์</button></div>` : ''}
+    <button class="big ghost" data-act="closeDlg">ยกเลิก</button>`);
+  shPreview();
+}
+const shKwList = () => ($('#shKw')?.value || '').split(/[,،]/).map(k => k.trim()).filter(Boolean);
+function shPreview() {
+  const e = $('#shPrev'); if (!e) return;
+  const kw = shKwList(), ms = [...new Set(state.acts.filter(a => kwMatch(a.model, kw)).map(a => a.model))];
+  const n = state.acts.filter(a => kwMatch(a.model, kw)).length;
+  e.innerHTML = kw.length ? `ตอนนี้ตรง <b>${num(n)}</b> เครื่อง · ${ms.length} รุ่น${ms.length ? ': ' + ms.slice(0, 8).map(esc).join(', ') + (ms.length > 8 ? ' …' : '') : ''}<br><small>รุ่นใหม่ที่มีคำเหล่านี้จะขึ้นในลิงก์อัตโนมัติ</small>` : `ทุกยี่ห้อ · ${num(n)} เครื่อง`;
 }
 function viewAct() {
-  if (isIssuer() && state.actShare == null) setTimeout(loadActShare, 0);
+  if (isIssuer() && state.actShares == null) setTimeout(loadActShare, 0);
   return errBanner() + `<div class="stats" id="actCount">${actStatsHtml()}</div>
   ${isViewer() ? '<p class="act-info" style="margin:0 0 12px">👁 บัญชีนี้ดูได้อย่างเดียว</p>' : `<section class="card"><h2>บันทึก Activate</h2><p class="hint">กรอกครบ รุ่น · IMEI · สี แล้วกดบันทึก = <b>Activated</b> ทันที</p><div id="actForm">${actFormHtml()}</div></section>`}
   <section class="card"><h2>สถานะ Activate แยกตามรุ่น</h2><div id="actSum">${actSummaryHtml()}</div></section>
-  ${isIssuer() ? `<details class="card act-admin" ${state.actShare?.on ? 'open' : ''}><summary><b>🔒 สิทธิ์การดู & ลิงก์แชร์</b></summary><div id="actAdmin">${actAdminHtml()}</div></details>` : ''}
+  ${isIssuer() ? `<details class="card act-admin" ${state.actShares?.some(x => x.on) ? 'open' : ''}><summary><b>🔒 สิทธิ์การดู & ลิงก์แชร์<span id="shCnt">${shCntTxt()}</span></b></summary><div id="actAdmin">${actAdminHtml()}</div></details>` : ''}
   <section class="card" style="padding:14px 12px"><h2>รายการ IMEI</h2>
     <div class="row" style="margin:0 0 10px;flex-wrap:nowrap"><input data-bind="actQ" placeholder="🔍 ค้นหา IMEI / สี / ผู้บันทึก" value="${esc(state.actQ)}" style="margin:0;flex:1"><button data-act="actExport" style="flex:0 0 auto">⬇️ Excel</button></div>
     <div id="actSelBar">${actSelBarHtml()}</div>
@@ -1167,7 +1194,8 @@ function exportActs() {
   const head = [H('ลำดับ'), H('รุ่น'), H('IMEI'), H('วันที่ Activate'), H('สี'), H('สถานะ'), H('ผู้ลงข้อมูล'), ...(pub ? [] : [H('หมายเหตุ')])];
   const rows = [head, ...list.map((a, i) => [{ v: list.length - i, s: 2, n: 1 }, T(a.model), { v: a.imei, s: 3 }, T(d(a.activated_at)), T(a.color), T('Activated'), T(a.by_name), ...(pub ? [] : [T(a.note)])])];
   const tag = [state.actM, q && 'ค้นหา-' + q].filter(Boolean).join('-').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
-  downloadBlob(`Activate-${todayISO()}${tag ? '-' + tag : ''}.xlsx`, XL.workbook([{ name: 'Activate', widths: [8, 28, 20, 18, 14, 12, 18, ...(pub ? [] : [26])], rows, freeze: true, filter: true }]));
+  const ln = pub && state.pub.name && state.pub.name !== 'ทุกยี่ห้อ' ? '-' + state.pub.name.replace(/[\\/:*?"<>|\s]+/g, '_') : '';
+  downloadBlob(`Activate${ln}-${todayISO()}${tag ? '-' + tag : ''}.xlsx`, XL.workbook([{ name: 'Activate', widths: [8, 28, 20, 18, 14, 12, 18, ...(pub ? [] : [26])], rows, freeze: true, filter: true }]));
   toast(`ส่งออก ${num(list.length)} รายการ`);
 }
 
@@ -1177,7 +1205,7 @@ async function loadPublic() {
   try {
     const { data, error } = await sb.rpc('act_public', { p_token: shareToken });
     if (error) throw error;
-    state.pub = data?.ok ? { ok: true, at: data.at } : { ok: false };
+    state.pub = data?.ok ? { ok: true, at: data.at, name: data.name || '' } : { ok: false };
     state.acts = data?.ok ? data.items : [];
   } catch (e) { state.pub = { ok: false, err: errMsg(e) }; }
   renderPublic();
@@ -1187,7 +1215,7 @@ function renderPublic() {
   const p = state.pub;
   $('#app').innerHTML = !p ? '<p class="muted center" style="margin-top:40px">กำลังโหลด...</p>'
     : !p.ok ? `<div class="empty" style="margin-top:24px"><i>🔒</i><b>ลิงก์นี้ปิดใช้งานแล้ว หรือไม่ถูกต้อง</b><span>${p.err ? esc(p.err) : 'ขอลิงก์ใหม่จากผู้ดูแล'}</span></div>`
-    : `<div class="news-hero"><div><small>${ORG ? esc(ORG) + ' · ' : ''}ดูอย่างเดียว</small><b>สถานะ Activate</b><small style="color:#cfd6dc;letter-spacing:0">อัปเดต ${fmt(p.at)}</small></div><button class="pub-ref" data-act="pubRefresh" aria-label="โหลดใหม่">🔄</button></div>
+    : `<div class="news-hero"><div><small>${ORG ? esc(ORG) + ' · ' : ''}ดูอย่างเดียว</small><b>สถานะ Activate${p.name && p.name !== 'ทุกยี่ห้อ' ? ' · ' + esc(p.name) : ''}</b><small style="color:#cfd6dc;letter-spacing:0">อัปเดต ${fmt(p.at)}</small></div><button class="pub-ref" data-act="pubRefresh" aria-label="โหลดใหม่">🔄</button></div>
       <div class="stats" id="actCount">${actStatsHtml()}</div>
       <section class="card"><h2>แยกตามรุ่น</h2><div id="actSum">${actSummaryHtml()}</div></section>
       <section class="card" style="padding:14px 12px"><h2>รายการ IMEI</h2>
@@ -1823,9 +1851,21 @@ const actions = {
     await rpc('act_set_access', { p_mode: d.m }); state.actAccess = d.m;
     document.querySelectorAll('[data-act=actAccess]').forEach(b => b.classList.toggle('on', b.dataset.m === d.m)); toast('บันทึกสิทธิ์แล้ว');
   }),
-  shareCopy: async () => { const v = $('#shareLink')?.value || ''; try { await navigator.clipboard.writeText(v); toast('คัดลอกลิงก์แล้ว'); } catch { const i = $('#shareLink'); i?.select(); document.execCommand?.('copy'); toast('คัดลอกลิงก์แล้ว'); } },
-  shareOpen: () => { const v = $('#shareLink')?.value; if (v) window.open(v, '_blank'); },
-  shareNew: () => { if (!confirm('สร้างลิงก์ใหม่? ลิงก์เดิมที่ส่งไปแล้วจะเปิดไม่ได้อีก')) return; guarded(async () => { state.actShare = await rpc('act_share_set', { p_on: true, p_new: true }); $('#actAdmin').innerHTML = actAdminHtml(); toast('สร้างลิงก์ใหม่แล้ว'); }); },
+  shCopy: async d => { const i = $('#shl-' + d.id), v = i?.value || ''; try { await navigator.clipboard.writeText(v); } catch { i?.select(); document.execCommand?.('copy'); } toast('คัดลอกลิงก์แล้ว'); },
+  shOpen: d => { const x = state.actShares?.find(v => v.id === +d.id); if (x) window.open(shareUrl(x.token), '_blank'); },
+  shToggle: d => guarded(async () => { const x = state.actShares.find(v => v.id === +d.id); await rpc('act_share_save', { p_id: x.id, p_name: x.name, p_keywords: x.keywords, p_on: !x.on, p_new: false }); await loadActShare(); toast(x.on ? `ปิดลิงก์ ${x.name} แล้ว — ลิงก์เปิดไม่ได้` : `เปิดลิงก์ ${x.name} แล้ว`); }),
+  shEdit: d => shEditDlg(d.id),
+  shKwAdd: d => { const kw = shKwList(); if (!kw.some(k => k.toLowerCase() === d.v.toLowerCase())) kw.push(d.v); $('#shKw').value = kw.join(', '); if (!$('#shName').value.trim()) $('#shName').value = d.v; shPreview(); },
+  shSave: d => guarded(async () => {
+    const name = $('#shName').value.trim(); if (!name) return toast('กรุณาตั้งชื่อลิงก์', true);
+    const x = d.id ? state.actShares.find(v => v.id === +d.id) : null;
+    await rpc('act_share_save', { p_id: x ? x.id : null, p_name: name, p_keywords: shKwList(), p_on: x ? x.on : true, p_new: false });
+    dlg().close(); await loadActShare(); toast(x ? 'บันทึกแล้ว' : `สร้างลิงก์ ${name} แล้ว — กดคัดลอกส่งได้เลย`);
+  }),
+  shRegen: d => { if (!confirm('สร้างรหัสลิงก์ใหม่? ลิงก์เดิมที่ส่งไปแล้วจะเปิดไม่ได้อีก')) return; guarded(async () => { const x = state.actShares.find(v => v.id === +d.id);
+    await rpc('act_share_save', { p_id: x.id, p_name: x.name, p_keywords: x.keywords, p_on: true, p_new: true }); dlg().close(); await loadActShare(); toast('สร้างลิงก์ใหม่แล้ว'); }); },
+  shDel: d => { const x = state.actShares.find(v => v.id === +d.id); if (!confirm(`ลบลิงก์ “${x.name}”? คนที่มีลิงก์นี้จะเปิดไม่ได้อีก`)) return;
+    guarded(async () => { await rpc('act_share_delete', { p_id: x.id }); dlg().close(); await loadActShare(); toast('ลบลิงก์แล้ว'); }); },
   pubRefresh: () => loadPublic(),
   actPick: d => { state.actM = d.m || ''; renderActs(); $('#actList')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); },
   actColor: d => { const c = $('#actColor'); if (c) c.value = d.v; state.act.color = d.v; },
@@ -2010,7 +2050,7 @@ const actions = {
   logout: async () => {
     if (!confirm('ออกจากระบบ?')) return;
     await sb.auth.signOut();
-    Object.assign(state, { session: null, role: 'requester', me: { name: '', dept: '', username: '' }, anns: [], annEdit: null, acts: [], view: '', open: [], openMap: new Map(), docs: [], reqs: [], models: [], modelMap: new Map() });
+    Object.assign(state, { session: null, role: 'requester', me: { name: '', dept: '', username: '' }, anns: [], annEdit: null, acts: [], actShares: null, view: '', open: [], openMap: new Map(), docs: [], reqs: [], models: [], modelMap: new Map() });
     render();
   },
   exportCsv: () => guarded(async () => {
@@ -2077,10 +2117,7 @@ function onBind(e) {
     t.checked ? state.imeiSel.add(t.dataset.imei) : state.imeiSel.delete(t.dataset.imei); t.closest('.mrow')?.classList.toggle('picked', t.checked);
     const b = $('#imeiSelBar'); if (b) b.innerHTML = imeiSelBarHtml(t.dataset.id); return;
   }
-  if (t.id === 'actShareOn' && e.type === 'change') {
-    guarded(async () => { try { state.actShare = await rpc('act_share_set', { p_on: t.checked, p_new: false }); $('#actAdmin').innerHTML = actAdminHtml(); toast(t.checked ? 'เปิดลิงก์แล้ว — คัดลอกส่งให้คนที่ต้องการดูได้เลย' : 'ปิดลิงก์แล้ว — ลิงก์เดิมเปิดไม่ได้'); } catch (err) { t.checked = !t.checked; throw err; } });
-    return;
-  }
+  if (t.id === 'shKw') { shPreview(); return; }
   if (t.id === 'impFile' && e.type === 'change') { const f = t.files && t.files[0]; t.value = ''; if (f) readImportFile(f); return; }
   if (t.id === 'impCreate' && e.type === 'change') { state.impCreate = t.checked; renderImp(); return; }
   if (t.dataset.tpl) { const n = Math.max(0, Math.min(2000, Math.floor(+t.value || 0))); if (n) state.tpl[t.dataset.tpl] = n; else delete state.tpl[t.dataset.tpl]; t.closest('.pick').classList.toggle('on', n > 0); const tt = $('#tplTotal'); if (tt) tt.textContent = tplTotal(); return; }

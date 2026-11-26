@@ -465,3 +465,13 @@ td.dcol small{display:block}
   .pub-tbl th{font-size:11px}
 }
 .pub-tbl td:nth-child(2),.pub-tbl td:last-child{word-break:normal;overflow-wrap:break-word;min-width:64px}
+
+/* ===== v3.3: หลายลิงก์แชร์ ===== */
+.sh-card{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0;background:#fff}
+.sh-card.off{background:#f6f7f8;opacity:.8}
+.sh-top{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:2px}
+.sh-top b{font-size:15px}
+.kw{display:inline-block;background:#fff1c2;border-radius:4px;padding:0 6px;font-weight:600;color:var(--ink)}
+.sh-btns{display:flex;gap:6px;margin-top:8px}
+.sh-btns button{flex:1;padding:7px 6px;font-size:13px}
+@media (max-width:600px){.pub-tbl th{white-space:normal;line-height:1.25;vertical-align:bottom}}
