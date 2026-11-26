@@ -442,3 +442,26 @@ td.dcol small{display:block}
 .out-r{flex-wrap:wrap;column-gap:8px;row-gap:0}
 .out-r .m{white-space:nowrap}
 .out-r .d{margin-left:auto}
+
+/* ===== v3.2.1: ตารางลิงก์แชร์ แถวเดียว ===== */
+.pub-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:8px}
+.pub-tbl{width:100%;border-collapse:collapse;font-size:13px;min-width:640px}
+.pub-tbl th{position:sticky;top:0;background:var(--ink,#1d2329);color:#fff;font-weight:600;text-align:left;padding:8px;white-space:nowrap}
+.pub-tbl td{padding:7px 8px;border-top:1px solid var(--line);white-space:nowrap;vertical-align:middle}
+.pub-tbl tbody tr:nth-child(even){background:#f7f9fa}
+.pub-tbl td.n{color:var(--mut);font-size:11.5px;text-align:right}
+.pub-tbl td.code{font:600 13px var(--mono)}
+.pub-tbl td.dt small{color:var(--mut)}
+.pub-tbl .st{color:#11804a;font-weight:600}
+.pub-tbl{min-width:0;table-layout:auto}
+.pub-tbl td.dt small{display:block;font-size:11px}
+.pub-tbl td.m,.pub-tbl td:nth-child(2),.pub-tbl td:last-child{white-space:normal;word-break:break-word}
+@media (max-width:600px){
+  .pub-tbl{font-size:11.5px}
+  .pub-tbl th,.pub-tbl td{padding:6px 4px}
+  .pub-tbl th:first-child,.pub-tbl td.n{display:none}
+  .pub-tbl td.code{font-size:11px;letter-spacing:-.02em}
+  .pub-tbl .st-t{display:none}
+  .pub-tbl th{font-size:11px}
+}
+.pub-tbl td:nth-child(2),.pub-tbl td:last-child{word-break:normal;overflow-wrap:break-word;min-width:64px}

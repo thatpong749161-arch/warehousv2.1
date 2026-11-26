@@ -16,7 +16,7 @@ const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
 const MOVE_T = { REG: 'ลง IMEI ของเดิม', SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก', viewer: 'ผู้ดู Activate' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '3.2.0';
+const APP_VER = '3.2.2';
 // เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
 const ID_DOMAIN = 'loan.local';
 const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
@@ -170,6 +170,7 @@ const XL = (() => {
     return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">`
       + (sh.freeze ? `<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>` : '')
       + `<cols>${(sh.widths || []).map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('')}</cols><sheetData>${rows}</sheetData>`
+      + (sh.filter && sh.rows.length ? `<autoFilter ref="A1:${col(sh.rows[0].length - 1)}${sh.rows.length}"/>` : '')
       + (sh.validation ? `<dataValidations count="1"><dataValidation type="list" allowBlank="1" showErrorMessage="0" sqref="${sh.validation.sqref}"><formula1>${x(sh.validation.formula)}</formula1></dataValidation></dataValidations>` : '')
       + `</worksheet>`;
   }
@@ -1079,7 +1080,7 @@ function actSelBarHtml() {
   return `<div class="selbar"><b>เลือก ${num(n)}</b><button data-act="actSelAll">เลือกทั้งหมด</button><button class="danger" data-act="actSelDel" ${n ? '' : 'disabled'}>🗑 ลบ${n ? ' ' + n : ''}</button><button data-act="actSelOff">ยกเลิก</button></div>`;
 }
 const renderSelBar = () => { const b = $('#actSelBar'); if (b) b.innerHTML = actSelBarHtml(); };
-const renderActs = () => { renderSelBar(); const e = $('#actList'); if (e) e.innerHTML = actRowsHtml(); const c = $('#actCount'); if (c) c.innerHTML = actStatsHtml(); const t = $('#actSum'); if (t) t.innerHTML = actSummaryHtml(); };
+const renderActs = () => { renderSelBar(); const e = $('#actList'); if (e) e.innerHTML = state.pub ? pubRowsHtml() : actRowsHtml(); const c = $('#actCount'); if (c) c.innerHTML = actStatsHtml(); const t = $('#actSum'); if (t) t.innerHTML = actSummaryHtml(); };
 function actStatsHtml() {
   const today = todayISO(), month = today.slice(0, 7), d = a => new Date(a.activated_at).toLocaleDateString('sv-SE');
   return `<div><b>${num(state.acts.length)}</b><small>Activate ทั้งหมด</small></div><div><b>${num(state.acts.filter(a => d(a) === today).length)}</b><small>วันนี้</small></div><div><b>${num(state.acts.filter(a => d(a).startsWith(month)).length)}</b><small>เดือนนี้</small></div>`;
@@ -1090,7 +1091,7 @@ function actAdminHtml() {
   const A = [['all', 'ทุกคนเห็นทั้งหมด'], ['own', 'ผู้เบิกเห็นเฉพาะของตัวเอง'], ['issuer', 'เฉพาะผู้จ่ายเบิก']];
   return `<p class="hint" style="margin-top:10px">ใครเห็นเมนู Activate ในแอป (ผู้จ่ายเบิกเห็นทั้งหมดเสมอ)</p>
     <div class="seg seg3">${A.map(([k, t]) => `<button data-act="actAccess" data-m="${k}" class="${state.actAccess === k ? 'on' : ''}">${t}</button>`).join('')}</div>
-    <p class="hint" style="margin-top:14px">ลิงก์ลับสำหรับดูตาราง Activate <b>โดยไม่ต้องล็อกอิน</b> (ดูอย่างเดียว · ไม่แสดงชื่อผู้บันทึก) — ใครมีลิงก์ก็เปิดดูได้ จนกว่าจะปิดหรือสร้างลิงก์ใหม่</p>
+    <p class="hint" style="margin-top:14px">ลิงก์ลับสำหรับดูตาราง Activate <b>โดยไม่ต้องล็อกอิน</b> (ดูอย่างเดียว · แสดงรุ่น IMEI วันที่ สี สถานะ ผู้ลงข้อมูล) — ใครมีลิงก์ก็เปิดดูได้ จนกว่าจะปิดหรือสร้างลิงก์ใหม่</p>
     ${sh == null ? '<p class="muted">กำลังโหลด...</p>' : `<label class="chk"><input type="checkbox" id="actShareOn" ${sh.on ? 'checked' : ''}> เปิดใช้ลิงก์ดูตาราง</label>
     ${sh.on && link ? `<div class="share-box"><input id="shareLink" readonly value="${esc(link)}"><button class="primary" data-act="shareCopy">📋 คัดลอก</button></div>
       <div class="row" style="margin:8px 0 0"><button data-act="shareOpen">↗ เปิดดู</button><button class="danger" data-act="shareNew">🔄 สร้างลิงก์ใหม่ (ลิงก์เก่าใช้ไม่ได้)</button></div>` : ''}`}`;
@@ -1155,11 +1156,19 @@ const actSave = auto => guarded(async () => {
   beep(true); toast(`Activated ${s} · ${f.model} · ${f.color}`);
   if (!matchMedia('(hover:none)').matches) $('#actImei')?.focus();
 });
+// ส่งออกตามที่แสดงอยู่ (ค้นหา / กรองรุ่น) · รุ่น · IMEI · วันที่ · สี · สถานะ · ผู้ลงข้อมูล — ใหม่อยู่บน · มีปุ่มกรองที่หัวคอลัมน์
 function exportActs() {
-  const H = v => ({ v, s: 1 }), T = v => ({ v, s: 2 });
-  const rows = [[H('วันที่ Activate'), H('รุ่น'), H('IMEI'), H('สี'), H('สถานะ'), H('ผู้บันทึก'), H('หมายเหตุ')],
-    ...state.acts.map(a => [T(new Date(a.activated_at).toLocaleString('th-TH', { dateStyle: 'short', timeStyle: 'short' })), T(a.model), { v: a.imei, s: 3 }, T(a.color), T('Activated'), T(a.by_name), T(a.note)])];
-  downloadBlob(`Activate-${todayISO()}.xlsx`, XL.workbook([{ name: 'Activate', widths: [18, 30, 20, 16, 12, 18, 26], rows, freeze: true }]));
+  const q = state.actQ.trim().toLowerCase(), pub = !!state.pub;
+  const list = state.acts.filter(a => (!state.actM || a.model === state.actM) && (!q || [a.imei, a.model, a.color, a.by_name, a.note].some(x => String(x || '').toLowerCase().includes(q))))
+    .sort((a, b) => new Date(b.activated_at) - new Date(a.activated_at));
+  if (!list.length) return toast('ไม่มีรายการให้ส่งออก', true);
+  const H = v => ({ v, s: 1 }), T = v => ({ v: v ?? '', s: 2 });
+  const d = x => { const t = new Date(x); return t.toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: 'numeric' }) + ' ' + t.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }); };
+  const head = [H('ลำดับ'), H('รุ่น'), H('IMEI'), H('วันที่ Activate'), H('สี'), H('สถานะ'), H('ผู้ลงข้อมูล'), ...(pub ? [] : [H('หมายเหตุ')])];
+  const rows = [head, ...list.map((a, i) => [{ v: list.length - i, s: 2, n: 1 }, T(a.model), { v: a.imei, s: 3 }, T(d(a.activated_at)), T(a.color), T('Activated'), T(a.by_name), ...(pub ? [] : [T(a.note)])])];
+  const tag = [state.actM, q && 'ค้นหา-' + q].filter(Boolean).join('-').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
+  downloadBlob(`Activate-${todayISO()}${tag ? '-' + tag : ''}.xlsx`, XL.workbook([{ name: 'Activate', widths: [8, 28, 20, 18, 14, 12, 18, ...(pub ? [] : [26])], rows, freeze: true, filter: true }]));
+  toast(`ส่งออก ${num(list.length)} รายการ`);
 }
 
 /* ---------- หน้าดูตาราง Activate ผ่านลิงก์ (ไม่ต้องล็อกอิน) ---------- */
@@ -1182,8 +1191,20 @@ function renderPublic() {
       <div class="stats" id="actCount">${actStatsHtml()}</div>
       <section class="card"><h2>แยกตามรุ่น</h2><div id="actSum">${actSummaryHtml()}</div></section>
       <section class="card" style="padding:14px 12px"><h2>รายการ IMEI</h2>
-        <div class="row" style="margin:0 0 10px;flex-wrap:nowrap"><input data-bind="actQ" placeholder="🔍 ค้นหา IMEI / สี" value="${esc(state.actQ)}" style="margin:0;flex:1"><button data-act="actExport" style="flex:0 0 auto">⬇️ Excel</button></div>
-        <div id="actList">${actRowsHtml()}</div></section>`;
+        <div class="row" style="margin:0 0 10px;flex-wrap:nowrap"><input data-bind="actQ" placeholder="🔍 ค้นหา รุ่น / IMEI / สี / ผู้ลงข้อมูล" value="${esc(state.actQ)}" style="margin:0;flex:1"><button data-act="actExport" style="flex:0 0 auto">⬇️ Excel</button></div>
+        <div id="actList">${pubRowsHtml()}</div></section>`;
+}
+// ตารางแบบแถวเดียว: รุ่น · IMEI · วันที่ · สี · สถานะ · ผู้ลงข้อมูล — ใหม่อยู่บน เก่าอยู่ล่าง
+function pubRowsHtml() {
+  const q = state.actQ.trim().toLowerCase();
+  const list = state.acts.filter(a => (!state.actM || a.model === state.actM) && (!q || [a.imei, a.model, a.color, a.by_name].some(x => String(x || '').toLowerCase().includes(q))))
+    .sort((a, b) => new Date(b.activated_at) - new Date(a.activated_at));
+  if (!list.length) return '<p class="muted center" style="margin:6px 0">ไม่พบรายการ</p>';
+  const shown = list.slice(0, 2000);
+  return `<p class="hint" style="margin:0 0 6px">${num(list.length)} รายการ${state.actM ? ` · รุ่น ${esc(state.actM)}` : ''} · ใหม่สุดอยู่บน</p>
+  <div class="pub-wrap"><table class="pub-tbl"><thead><tr><th>#</th><th>รุ่น</th><th>IMEI</th><th>วันที่</th><th>สี</th><th>สถานะ</th><th>ผู้ลงข้อมูล</th></tr></thead><tbody>
+  ${shown.map((a, i) => `<tr><td class="n">${list.length - i}</td><td>${esc(a.model)}</td><td class="code">${esc(a.imei)}</td><td class="dt">${new Date(a.activated_at).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: '2-digit' })}<small>${new Date(a.activated_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })}</small></td><td>${esc(a.color)}</td><td><span class="st">✓<span class="st-t"> Activated</span></span></td><td>${esc(a.by_name || '-')}</td></tr>`).join('')}
+  </tbody></table></div>${list.length > shown.length ? `<p class="hint center">แสดง ${num(shown.length)} รายการล่าสุด — ค้นหาหรือโหลด Excel เพื่อดูทั้งหมด</p>` : ''}`;
 }
 
 /* ประวัติเอกสาร */
@@ -2075,7 +2096,7 @@ function onBind(e) {
   const v = t.type === 'checkbox' ? t.checked : t.value;
   const [o, k] = b.split('.');
   if (k) state[o][k] = v; else state[o] = v;
-  if (b === 'actQ' && state.pub) { renderActs(); return; }
+  if (b === 'actQ' && state.pub) { const e = $('#actList'); if (e) e.innerHTML = pubRowsHtml(); return; }
   if (b === 'outQ') renderOutList();
   else if (b === 'hq' || b === 'ht') renderHistoryList();
   else if (b === 'pq') renderReqList();

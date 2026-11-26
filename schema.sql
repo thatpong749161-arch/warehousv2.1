@@ -638,7 +638,7 @@ begin
     return jsonb_build_object('ok', false);
   end if;
   return jsonb_build_object('ok', true, 'at', now(), 'items', coalesce((
-    select jsonb_agg(jsonb_build_object('imei', imei, 'model', model, 'color', color, 'activated_at', activated_at, 'status', status)
+    select jsonb_agg(jsonb_build_object('imei', imei, 'model', model, 'color', color, 'activated_at', activated_at, 'status', status, 'by_name', by_name)
                      order by activated_at desc, id desc) from activations), '[]'::jsonb));
 end $$;
 
