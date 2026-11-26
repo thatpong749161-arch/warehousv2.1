@@ -116,6 +116,35 @@ create table if not exists public.request_items (
 create index if not exists request_items_req_idx on public.request_items(req_no);
 
 alter table public.loans     add column if not exists model_id bigint references public.models(id);
+-- v3.0 หมวดของใช้ (เก้าอี้ บูธ ...) — นับเป็นจำนวน ไม่มี IMEI · returnable = ต้องคืน / false = ใช้แล้วหมดไป
+alter table public.models    add column if not exists kind       text    not null default 'device';
+alter table public.models    add column if not exists unit       text    not null default 'เครื่อง';
+alter table public.models    add column if not exists returnable boolean not null default true;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'models_kind_chk') then
+    alter table public.models add constraint models_kind_chk check (kind in ('device','item'));
+  end if;
+end $$;
+alter table public.document_items add column if not exists qty int not null default 1;
+create table if not exists public.item_loans (
+  id          bigint generated always as identity primary key,
+  model_id    bigint not null references public.models(id),
+  model       text not null,
+  unit        text not null default '',
+  person      text not null,
+  dept        text not null default '',
+  purpose     text not null default '',
+  req_no      text,
+  issue_doc   text not null references public.documents(doc_no),
+  qty         int  not null check (qty > 0),
+  returned    int  not null default 0,
+  lost        int  not null default 0,
+  last_note   text not null default '',
+  issued_at   timestamptz not null default now(),
+  issued_by   text not null default '',
+  closed_at   timestamptz
+);
+create index if not exists item_loans_open_idx on public.item_loans(person) where closed_at is null;
 alter table public.loans     add column if not exists req_no   text;
 alter table public.documents add column if not exists req_no   text not null default '';
 -- รับคืนไม่ครบ: เก็บรายการเครื่องที่ยังไม่คืน + เหตุผล ไว้ในใบรับคืน และเหตุผลล่าสุดไว้ที่เครื่อง
@@ -355,6 +384,7 @@ begin
   if p_mode not in ('new','register') then raise exception 'รูปแบบการรับเข้าไม่ถูกต้อง'; end if;
   select * into m from models where id = p_model_id for update;
   if not found then raise exception 'ไม่พบรุ่นนี้'; end if;
+  if m.kind = 'item' then raise exception '% เป็นของใช้ — รับเข้าด้วยจำนวน ไม่ต้องยิง IMEI', m.name; end if;
   select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_list from unnest(coalesce(p_imeis, '{}')) x where trim(x) <> '';
   v_n := cardinality(v_list);
   if v_n = 0 then raise exception 'ยังไม่ได้ยิง IMEI'; end if;
@@ -639,6 +669,21 @@ begin
   return v_id;
 end $$;
 
+-- สร้าง/แก้ “ของใช้” (ไม่มี IMEI นับเป็นจำนวน)
+create or replace function public.item_save(p_id bigint, p_name text, p_unit text, p_returnable boolean, p_active boolean, p_stock int, p_by text)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare v_id bigint; v_kind text;
+begin
+  if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
+  if p_id is not null then
+    select kind into v_kind from models where id = p_id;
+    if v_kind is distinct from 'item' then raise exception 'รายการนี้เป็นเครื่อง (IMEI) ไม่ใช่ของใช้'; end if;
+  end if;
+  v_id := model_save(p_id, p_name, p_active, p_stock, p_by);
+  update models set kind = 'item', unit = coalesce(nullif(trim(p_unit), ''), 'ชิ้น'), returnable = coalesce(p_returnable, true) where id = v_id;
+  return v_id;
+end $$;
+
 -- p_mode: add = รับเข้า, sub = ตัดออก, set = ตั้งยอดตามที่ตรวจนับ
 create or replace function public.stock_adjust(p_model_id bigint, p_mode text, p_qty int, p_note text, p_by text)
 returns int language plpgsql security definer set search_path = public as $$
@@ -683,7 +728,7 @@ begin
     if not found then raise exception 'ไม่พบรุ่นที่เลือก (อาจถูกปิดใช้งาน)'; end if;
     select a.avail into v_av from model_avail() a where a.model_id = rec.mid;
     if rec.q > coalesce(v_av, 0) then
-      raise exception 'รุ่น % พร้อมเบิกเหลือ % เครื่อง (ขอ % เครื่อง)', m.name, coalesce(v_av, 0), rec.q;
+      raise exception '% พร้อมเบิกเหลือ % % (ขอ % %)', m.name, coalesce(v_av, 0), m.unit, rec.q, m.unit;
     end if;
   end loop;
 
@@ -721,30 +766,45 @@ returns text language plpgsql security definer set search_path = public as $$
 declare
   r requests%rowtype; ri request_items%rowtype; v_no text; it jsonb; dv devices%rowtype;
   v_imei text; v_model text; v_holder text; n int; rec record; v_bal int; v_by text := coalesce(trim(p_by),'');
+  v_dev jsonb; v_itm jsonb; m models%rowtype;
 begin
   if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
   select * into r from requests where req_no = p_req_no for update;
   if not found then raise exception 'ไม่พบคำขอ'; end if;
   if r.status <> 'PENDING' then raise exception 'คำขอนี้ไม่ได้อยู่ในสถานะรอจ่ายแล้ว'; end if;
   if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
-    raise exception 'ยังไม่ได้สแกนเครื่อง';
+    raise exception 'ยังไม่ได้สแกนเครื่อง / ใส่จำนวนของใช้';
   end if;
-  if (select count(distinct upper(trim(x->>'imei'))) from jsonb_array_elements(p_items) x) <> jsonb_array_length(p_items) then
+  -- แยก: เครื่อง (มี imei) · ของใช้ (มี qty) — ของใช้รุ่นเดียวกันรวมเป็นบรรทัดเดียว
+  select coalesce(jsonb_agg(x), '[]') into v_dev from jsonb_array_elements(p_items) x where coalesce(trim(x->>'imei'), '') <> '';
+  select coalesce(jsonb_agg(jsonb_build_object('model_id', mid, 'qty', q)), '[]') into v_itm
+  from (select (x->>'model_id')::bigint mid, sum(coalesce((x->>'qty')::int, 0))::int q from jsonb_array_elements(p_items) x
+        where coalesce(trim(x->>'imei'), '') = '' group by 1) t where q <> 0;
+  if exists (select 1 from jsonb_array_elements(v_itm) x where (x->>'qty')::int < 0) then raise exception 'จำนวนต้องไม่ติดลบ'; end if;
+  if exists (select 1 from jsonb_array_elements(v_itm) x join models mm on mm.id = (x->>'model_id')::bigint where mm.kind <> 'item') then
+    raise exception 'รุ่นที่มี IMEI ต้องยิง IMEI ทีละเครื่อง';
+  end if;
+  if exists (select 1 from jsonb_array_elements(v_dev) x join models mm on mm.id = (x->>'model_id')::bigint where mm.kind = 'item') then
+    raise exception 'ของใช้ไม่ต้องยิง IMEI — ใส่จำนวนแทน';
+  end if;
+  if jsonb_array_length(v_dev) = 0 and jsonb_array_length(v_itm) = 0 then raise exception 'ยังไม่ได้สแกนเครื่อง / ใส่จำนวนของใช้'; end if;
+  if (select count(distinct upper(trim(x->>'imei'))) from jsonb_array_elements(v_dev) x) <> jsonb_array_length(v_dev) then
     raise exception 'มี IMEI ซ้ำในรายการ';
   end if;
-  if exists (select 1 from jsonb_array_elements(p_items) x
+  if exists (select 1 from (select * from jsonb_array_elements(v_dev) union all select * from jsonb_array_elements(v_itm)) t(x)
              where not exists (select 1 from request_items i
                                where i.req_no = p_req_no and i.model_id = (x->>'model_id')::bigint)) then
     raise exception 'มีเครื่องที่ไม่ได้อยู่ในรุ่นที่ขอ';
   end if;
   for ri in select * from request_items where req_no = p_req_no loop
-    select count(*) into n from jsonb_array_elements(p_items) x where (x->>'model_id')::bigint = ri.model_id;
+    select count(*) into n from jsonb_array_elements(v_dev) x where (x->>'model_id')::bigint = ri.model_id;
+    n := n + coalesce((select sum((x->>'qty')::int) from jsonb_array_elements(v_itm) x where (x->>'model_id')::bigint = ri.model_id), 0);
     if n > ri.qty then raise exception 'รุ่น % จ่ายเกินจำนวนที่ขอ (% / %)', ri.model, n, ri.qty; end if;
     update request_items set issued = n where id = ri.id;
   end loop;
 
   -- ตรวจกับสต็อก IMEI: เครื่องที่ลงทะเบียนแล้วต้องอยู่ในคลังและเป็นรุ่นเดียวกับที่จ่าย
-  for it in select * from jsonb_array_elements(p_items) loop
+  for it in select * from jsonb_array_elements(v_dev) loop
     v_imei := upper(trim(it->>'imei'));
     select * into dv from devices where imei = v_imei for update;
     if found then
@@ -757,7 +817,7 @@ begin
     end if;
   end loop;
   -- เครื่องที่ยังไม่ลง IMEI: จ่ายได้ไม่เกินจำนวนของเดิมที่ยังไม่ลงทะเบียนของรุ่นนั้น
-  for rec in select (x->>'model_id')::bigint as mid, count(*)::int as c from jsonb_array_elements(p_items) x
+  for rec in select (x->>'model_id')::bigint as mid, count(*)::int as c from jsonb_array_elements(v_dev) x
              where not exists (select 1 from devices d where d.imei = upper(trim(x->>'imei'))) group by 1 loop
     select stock - (select count(*) from devices where model_id = rec.mid and status = 'IN_STOCK') into n from models where id = rec.mid;
     if rec.c > greatest(coalesce(n, 0), 0) then
@@ -766,11 +826,25 @@ begin
     end if;
   end loop;
 
+  -- ของใช้: ต้องมีของพอ
+  for it in select * from jsonb_array_elements(v_itm) loop
+    select * into m from models where id = (it->>'model_id')::bigint for update;
+    if m.stock < (it->>'qty')::int then raise exception '% คงเหลือ % % (จ่าย %)', m.name, m.stock, m.unit, (it->>'qty')::int; end if;
+  end loop;
+
   v_no := next_doc_no('ISS');
   insert into documents(doc_no, type, person, dept, purpose, note, by_name, req_no)
   values (v_no, 'ISSUE', r.person, r.dept, r.purpose, r.note, v_by, p_req_no);
 
-  for it in select * from jsonb_array_elements(p_items) loop
+  for it in select * from jsonb_array_elements(v_itm) loop
+    select * into m from models where id = (it->>'model_id')::bigint;
+    insert into document_items(doc_no, imei, model, qty) values (v_no, '', m.name, (it->>'qty')::int);
+    if m.returnable then
+      insert into item_loans(model_id, model, unit, person, dept, purpose, req_no, issue_doc, qty, issued_by)
+      values (m.id, m.name, m.unit, r.person, r.dept, r.purpose, p_req_no, v_no, (it->>'qty')::int, v_by);
+    end if;
+  end loop;
+  for it in select * from jsonb_array_elements(v_dev) loop
     v_imei := upper(trim(it->>'imei'));
     if v_imei !~ '^[A-Z0-9-]{5,30}$' then raise exception 'IMEI/ซีเรียล % ไม่ถูกต้อง', v_imei; end if;
     select name into v_model from models where id = (it->>'model_id')::bigint;
@@ -788,8 +862,9 @@ begin
   end loop;
 
   -- ตัดสต็อกตามจำนวนที่จ่ายจริง (ยอมให้ติดลบได้ เพราะเครื่องอยู่ในมือแล้ว — แอปจะแจ้งเตือน)
-  for rec in select (x->>'model_id')::bigint as mid, count(*)::int as c
-             from jsonb_array_elements(p_items) x group by 1 loop
+  for rec in select mid, sum(c)::int c from (
+               select (x->>'model_id')::bigint as mid, 1 as c from jsonb_array_elements(v_dev) x
+               union all select (x->>'model_id')::bigint, (x->>'qty')::int from jsonb_array_elements(v_itm) x) t group by 1 loop
     update models set stock = stock - rec.c where id = rec.mid returning stock into v_bal;
     insert into stock_moves(model_id, delta, balance, reason, ref, by_name)
     values (rec.mid, -rec.c, v_bal, 'ISSUE', v_no, v_by);
@@ -806,20 +881,25 @@ end $$;
 -- p_missing : เครื่องที่ยังค้างต่อ (ต้องมี p_reason)
 drop function if exists public.dev_return(text[],text,text);
 drop function if exists public.dev_return(text[],text,text,text[],text);
+drop function if exists public.dev_return(text[],text,text,text[],text,text[]);
+-- p_items   : ของใช้ [{"id":item_loans.id,"ret":คืน,"lost":ไม่คืน/เสีย/ใช้หมด}] — ที่เหลือค้างต่อ
 create or replace function public.dev_return(
-  p_imeis text[], p_by text, p_note text, p_missing text[] default '{}', p_reason text default '', p_sold text[] default '{}')
+  p_imeis text[], p_by text, p_note text, p_missing text[] default '{}', p_reason text default '', p_sold text[] default '{}', p_items jsonb default '[]')
 returns text language plpgsql security definer set search_path = public as $$
 declare
   v_no text; v_imei text; l loans%rowtype; v_persons text[] := '{}'; v_person text; v_dept text := '';
   v_by text := coalesce(trim(p_by),''); v_reason text := coalesce(trim(p_reason),'');
   v_ret text[]; v_sold text[]; v_missing text[]; v_all text[]; v_bal int; rec record;
+  il item_loans%rowtype; it jsonb; v_r int; v_l int; v_itn int := 0;
 begin
   if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
   select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_ret  from unnest(coalesce(p_imeis, '{}')) x where trim(x) <> '';
   select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_sold from unnest(coalesce(p_sold, '{}')) x where trim(x) <> '';
   select coalesce(array_agg(distinct upper(trim(x))), '{}') into v_missing
   from unnest(coalesce(p_missing, '{}')) x where trim(x) <> '' and not (upper(trim(x)) = any(v_sold));
-  if cardinality(v_ret) = 0 and cardinality(v_sold) = 0 then raise exception 'ยังไม่มีเครื่องที่จะคืนหรือขาย'; end if;
+  if jsonb_typeof(coalesce(p_items, '[]')) <> 'array' then raise exception 'รายการของใช้ไม่ถูกต้อง'; end if;
+  select count(*) into v_itn from jsonb_array_elements(coalesce(p_items, '[]')) x where coalesce((x->>'ret')::int, 0) + coalesce((x->>'lost')::int, 0) > 0;
+  if cardinality(v_ret) = 0 and cardinality(v_sold) = 0 and v_itn = 0 then raise exception 'ยังไม่มีเครื่องหรือของที่จะคืน'; end if;
   if v_ret && v_sold then raise exception 'เครื่องที่ยิงคืนแล้ว ระบุว่าขายซ้ำไม่ได้'; end if;
   if cardinality(v_missing) > 0 and v_reason = '' then raise exception 'กรุณาระบุเหตุผลของเครื่องที่ยังไม่คืน'; end if;
 
@@ -829,6 +909,17 @@ begin
     if not found then raise exception 'IMEI % ไม่ได้อยู่ในสถานะถูกเบิก', v_imei; end if;
     if not (l.person = any(v_persons)) then v_persons := v_persons || l.person; end if;
     v_dept := l.dept;
+  end loop;
+  for it in select * from jsonb_array_elements(coalesce(p_items, '[]')) loop
+    select * into il from item_loans where id = (it->>'id')::bigint and closed_at is null for update;
+    if not found then raise exception 'ไม่พบรายการของใช้ที่ค้าง'; end if;
+    v_r := coalesce((it->>'ret')::int, 0); v_l := coalesce((it->>'lost')::int, 0);
+    if v_r < 0 or v_l < 0 then raise exception 'จำนวนต้องไม่ติดลบ'; end if;
+    if v_r + v_l > il.qty - il.returned - il.lost then raise exception '% คืนเกินจำนวนที่ค้าง (ค้าง % %)', il.model, il.qty - il.returned - il.lost, il.unit; end if;
+    if v_r + v_l > 0 then
+      if not (il.person = any(v_persons)) then v_persons := v_persons || il.person; end if;
+      v_dept := il.dept;
+    end if;
   end loop;
   v_person := case when array_length(v_persons, 1) = 1 then v_persons[1] else 'หลายคน: ' || array_to_string(v_persons, ', ') end;
 
@@ -844,6 +935,25 @@ begin
 
   insert into document_items(doc_no, imei, model)
   select v_no, imei, model from loans where imei = any(v_ret) and returned_at is null order by id;
+  -- ของใช้
+  for it in select * from jsonb_array_elements(coalesce(p_items, '[]')) loop
+    v_r := coalesce((it->>'ret')::int, 0); v_l := coalesce((it->>'lost')::int, 0);
+    update item_loans set returned = returned + v_r, lost = lost + v_l,
+      last_note = case when v_l > 0 then 'ไม่คืน ' || v_l || ' ' || unit || coalesce(nullif(': ' || v_reason, ': '), '') || ' (' || v_no || ')'
+                       when qty - returned - lost - v_r > 0 and v_reason <> '' then 'ค้าง: ' || v_reason || ' (' || v_no || ')'
+                       else last_note end,
+      closed_at = case when returned + v_r + lost + v_l >= qty then now() end
+    where id = (it->>'id')::bigint returning * into il;
+    if v_r > 0 then
+      insert into document_items(doc_no, imei, model, qty) values (v_no, '', il.model, v_r);
+      update models set stock = stock + v_r where id = il.model_id returning stock into v_bal;
+      insert into stock_moves(model_id, delta, balance, reason, ref, by_name) values (il.model_id, v_r, v_bal, 'RETURN', v_no, v_by);
+    end if;
+    if v_l > 0 then
+      insert into stock_moves(model_id, delta, balance, reason, ref, note, by_name)
+      values (il.model_id, 0, (select stock from models where id = il.model_id), 'SOLD', v_no, 'ไม่คืน ' || v_l || ' ' || il.unit || coalesce(nullif(' — ' || v_reason, ' — '), ''), v_by);
+    end if;
+  end loop;
   update loans set returned_at = now(), return_doc = v_no, returned_by = v_by, closed_reason = 'RETURN'
   where imei = any(v_ret) and returned_at is null;
   update loans set returned_at = now(), return_doc = v_no, returned_by = v_by, closed_reason = 'SOLD',
@@ -888,10 +998,10 @@ begin
   if not is_issuer() then raise exception 'เฉพาะผู้จ่ายเบิกเท่านั้น'; end if;
   if coalesce(trim(p_confirm), '') <> 'ล้างข้อมูล' then raise exception 'คำยืนยันไม่ถูกต้อง — พิมพ์คำว่า ล้างข้อมูล'; end if;
   if p_scope = 'tx' then
-    truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters restart identity;
+    truncate request_items, requests, document_items, item_loans, loans, documents, stock_moves, doc_counters restart identity;
     delete from devices where status <> 'IN_STOCK'; -- เก็บเฉพาะเครื่องที่อยู่ในคลัง
   elsif p_scope = 'all' then
-    truncate request_items, requests, document_items, loans, documents, stock_moves, doc_counters, activations, devices, models restart identity;
+    truncate request_items, requests, document_items, item_loans, loans, documents, stock_moves, doc_counters, activations, devices, models restart identity;
   else
     raise exception 'ขอบเขตการล้างไม่ถูกต้อง';
   end if;
@@ -943,6 +1053,12 @@ create policy "read requests" on public.requests for select to authenticated
   using (created_by = auth.uid() or is_issuer());
 create policy "read request_items" on public.request_items for select to authenticated
   using (exists (select 1 from requests r where r.req_no = request_items.req_no));
+alter table public.item_loans enable row level security;
+drop policy if exists "read item_loans" on public.item_loans;
+create policy "read item_loans" on public.item_loans for select to authenticated
+  using (is_issuer() or exists (select 1 from requests r where r.req_no = item_loans.req_no and r.created_by = auth.uid()));
+revoke all on public.item_loans from anon, authenticated;
+grant select on public.item_loans to authenticated;
 create policy "read loans" on public.loans for select to authenticated
   using (is_issuer() or exists (select 1 from requests r where r.req_no = loans.req_no and r.created_by = auth.uid()));
 create policy "read documents" on public.documents for select to authenticated
@@ -967,7 +1083,9 @@ revoke all on function public.stock_adjust(bigint,text,int,text,text)          f
 revoke all on function public.req_create(text,text,text,text,text,jsonb)       from public, anon;
 revoke all on function public.req_cancel(text,text)                            from public, anon;
 revoke all on function public.req_fulfill(text,text,jsonb)                     from public, anon;
-revoke all on function public.dev_return(text[],text,text,text[],text,text[]) from public, anon;
+revoke all on function public.dev_return(text[],text,text,text[],text,text[],jsonb) from public, anon;
+revoke all on function public.item_save(bigint,text,text,boolean,boolean,int,text) from public, anon;
+grant execute on function public.item_save(bigint,text,text,boolean,boolean,int,text) to authenticated;
 grant execute on function public.is_issuer()                                   to authenticated;
 grant execute on function public.set_role(uuid,text)                           to authenticated;
 grant execute on function public.profile_update(text,text)                     to authenticated;
@@ -1028,6 +1146,6 @@ grant execute on function public.stock_adjust(bigint,text,int,text,text)       t
 grant execute on function public.req_create(text,text,text,text,text,jsonb)    to authenticated;
 grant execute on function public.req_cancel(text,text)                         to authenticated;
 grant execute on function public.req_fulfill(text,text,jsonb)                  to authenticated;
-grant execute on function public.dev_return(text[],text,text,text[],text,text[]) to authenticated;
+grant execute on function public.dev_return(text[],text,text,text[],text,text[],jsonb) to authenticated;
 
 notify pgrst, 'reload schema';

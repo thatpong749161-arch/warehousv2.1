@@ -14,7 +14,7 @@ const REQ_CLS = { PENDING: 'warn', ISSUED: 'ok', CANCELLED: '' };
 const MOVE_T = { REG: 'ลง IMEI ของเดิม', SOLD: 'ขาย (ไม่คืนสต็อก)', INIT: 'ยอดเริ่มต้น', IN: 'รับเข้า', OUT: 'ตัดออก', SET: 'ตรวจนับ', ISSUE: 'จ่าย', RETURN: 'รับคืน' };
 const ROLE_T = { requester: 'ผู้เบิก', issuer: 'ผู้จ่ายเบิก' };
 const DRAFT_KEY = 'draft-v2';
-const APP_VER = '2.9.0';
+const APP_VER = '3.0.0';
 // เข้าระบบด้วย ID: ระบบแปลง ID เป็นอีเมลภายใน (ไม่มีการส่งอีเมลจริง) · พิมพ์อีเมลเต็มก็ยังใช้ได้ (บัญชีเดิม)
 const ID_DOMAIN = 'loan.local';
 const toEmail = id => { id = String(id || '').trim(); return id.includes('@') ? id.toLowerCase() : id.toLowerCase() + '@' + ID_DOMAIN; };
@@ -37,9 +37,16 @@ const state = {
   req: { person: '', dept: '', purpose: '', note: '', qty: {} },
   ful: null, // { no, items: [{ imei, model_id }], cur: model_id }
   cart: { return: [] }, rnote: '', retPerson: '', retQ: '', loose: false,
-  outQ: '', hq: '', ht: '', rq: 'PENDING', pq: '', mq: '', sq: '', newModel: '', newQty: ''
+  outQ: '', hq: '', ht: '', rq: 'PENDING', pq: '', mq: '', sq: '', newModel: '', newQty: '',
+  stockTab: 'device', newItem: { name: '', unit: '', qty: '', ret: true }, iopen: [], retItems: {}
 };
 const isIssuer = () => state.role === 'issuer';
+// v3.0 ของใช้ (เก้าอี้ บูธ ...) = models.kind 'item' · นับเป็นจำนวน ไม่มี IMEI
+const isItemM = id => state.modelMap.get(+id)?.kind === 'item';
+const unitOf = id => state.modelMap.get(+id)?.unit || 'เครื่อง';
+const unitByName = n => state.models.find(m => m.name === n)?.unit || '';
+const devModels = () => state.models.filter(m => m.kind !== 'item');
+const ilRem = l => l.qty - l.returned - l.lost;
 
 /* ---------- เมนูตามสิทธิ์ ---------- */
 const IC = {
@@ -108,12 +115,13 @@ const opName = () => state.operator.trim() || state.me.name || state.me.username
 const daysSince = d => Math.max(0, Math.floor((Date.now() - new Date(d)) / 864e5));
 const reqQty = r => r.request_items.reduce((a, i) => a + i.qty, 0);
 const reqIssued = r => r.request_items.reduce((a, i) => a + (i.issued || 0), 0);
-const saveDraft = () => { try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ req: state.req, ful: state.ful, ret: state.cart.return, rnote: state.rnote, retPerson: state.retPerson, rcv: state.rcv })); } catch { } };
+const saveDraft = () => { try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ req: state.req, ful: state.ful, ret: state.cart.return, reti: state.retItems, rnote: state.rnote, retPerson: state.retPerson, rcv: state.rcv })); } catch { } };
 function loadDraft() {
   try {
     const d = JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null'); if (!d) return;
     Object.assign(state.req, d.req || {}); state.req.qty = d.req?.qty || {};
-    state.ful = d.ful || null; state.cart.return = d.ret || [];
+    state.ful = d.ful || null; state.cart.return = d.ret || []; state.retItems = d.reti || {};
+    if (state.ful && !state.ful.qty) state.ful.qty = {};
     state.rnote = d.rnote || ''; state.retPerson = d.retPerson || '';
     if (d.rcv) state.rcv = Object.assign({ model_id: null, mode: 'new', items: [], note: '' }, d.rcv);
   } catch { }
@@ -303,9 +311,10 @@ async function loadReqs() {
 async function loadOpen() {
   state.open = await fetchAll((a, b) => sb.from('loans').select('*').is('returned_at', null).order('issued_at', { ascending: false }).order('id').range(a, b));
   state.openMap = new Map(state.open.map(l => [l.imei, l]));
+  state.iopen = await fetchAll((a, b) => sb.from('item_loans').select('*').is('closed_at', null).order('issued_at').order('id').range(a, b));
 }
 async function loadDocs() {
-  const { data, error } = await sb.from('documents').select('*, document_items(imei, model)').order('created_at', { ascending: false }).limit(state.docsLimit);
+  const { data, error } = await sb.from('documents').select('*, document_items(imei, model, qty)').order('created_at', { ascending: false }).limit(state.docsLimit);
   if (error) throw error;
   state.docs = data;
 }
@@ -314,7 +323,7 @@ async function refresh() {
   try {
     await loadRole();
     const jobs = [loadModels(), loadReqs(), loadAppConfig(), loadAnns(), loadAvail(), loadActs()];
-    if (isIssuer()) jobs.push(loadOpen(), loadDocs(), loadDevices()); else { state.open = []; state.openMap = new Map(); state.docs = []; state.devMap = new Map(); }
+    if (isIssuer()) jobs.push(loadOpen(), loadDocs(), loadDevices()); else { state.open = []; state.iopen = []; state.openMap = new Map(); state.docs = []; state.devMap = new Map(); }
     await Promise.all(jobs); state.loadErr = '';
   } catch (e) { state.loadErr = errMsg(e); }
   fixView();
@@ -413,12 +422,13 @@ function addReturn(raw) {
 /* จ่ายตามคำขอ: ยิงได้เลย — ระบบหารุ่นจาก IMEI ในสต็อกเอง (กันยิงผิดรุ่น)
    เครื่องเดิมที่ยังไม่ลง IMEI: ใส่ในรุ่นที่แตะเลือกไว้ (หรือรุ่นเดียวที่ยังมีของไม่ลง IMEI) */
 const curReq = () => state.ful && state.reqs.find(r => r.req_no === state.ful.no);
-const fulCnt = id => state.ful.items.filter(x => x.model_id === id).length;
+const fulCnt = id => isItemM(id) ? (state.ful.qty?.[id] || 0) : state.ful.items.filter(x => x.model_id === id).length;
 const fulUnregUsed = id => state.ful.items.filter(x => x.model_id === id && x.unreg).length;
 const mName = id => state.modelMap.get(id)?.name || '-';
 function addFul(raw) {
   const r = curReq(); if (!r || r.status !== 'PENDING') return '✗ คำขอนี้ไม่ได้รอจ่ายแล้ว';
-  const f = state.ful, s = normImei(raw), lines = r.request_items;
+  const f = state.ful, s = normImei(raw), lines = r.request_items.filter(l => !isItemM(l.model_id));
+  if (!lines.length) return '✗ คำขอนี้มีแต่ของใช้ — ใส่จำนวนแทนการยิง';
   if (!validImei(s)) return `✗ ${s} ไม่ใช่ IMEI ที่ถูกต้อง (15 หลัก)`;
   if (f.items.some(x => x.imei === s)) return `✗ ยิง ${s} ซ้ำ`;
   const loan = state.openMap.get(s);
@@ -454,28 +464,40 @@ const scanBox = (kind, bulk = true) => `
     <button data-act="addBulk" data-k="${kind}" style="width:100%;margin-top:6px">เพิ่มรายการที่วาง</button></details>` : ''}
   <label class="chk"><input type="checkbox" data-bind="loose" ${state.loose ? 'checked' : ''}> ไม่ตรวจรูปแบบ IMEI (ใช้กับเลขซีเรียลอื่น)</label>`;
 
+function retItemsHtml() {
+  const il = retILoans(); if (!il.length) return '';
+  return `<div class="ret-items"><div class="pk-h" style="margin-top:${retLoans().length ? 14 : 0}px">🪑 ของใช้ที่ยืม — ใส่จำนวนที่คืน</div>
+    ${il.map(l => { const rem = ilRem(l), g = retIGot(l.id); return `<div class="ri-item ${g >= rem ? 'ok' : ''}">
+      <div class="grow"><b>${esc(l.model)}</b><small>ค้าง ${num(rem)} ${esc(l.unit)}${l.returned ? ` (จาก ${num(l.qty)})` : ''} · <span class="code">${esc(l.issue_doc)}</span>${l.last_note ? ` · <span class="warn-t">${esc(l.last_note)}</span>` : ''}</small></div>
+      <div class="step"><button data-act="retIQ" data-id="${l.id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="${rem}" data-reti="${l.id}" value="${g || ''}" placeholder="0" aria-label="คืน ${esc(l.model)}"><button data-act="retIQ" data-id="${l.id}" data-d="1" aria-label="เพิ่ม">+</button></div>
+      <button class="sm ${g >= rem ? 'primary' : ''}" data-act="retIQ" data-id="${l.id}" data-d="all">ครบ</button></div>`; }).join('')}</div>`;
+}
 function retListHtml() {
   if (!state.retPerson) return '<p class="muted center" style="margin:6px 0">เลือกผู้เบิก หรือยิง IMEI ได้เลย — ระบบเลือกผู้เบิกให้เอง</p>';
   const list = retLoans(), got = new Set(state.cart.return.map(x => x.imei)), n = list.filter(l => got.has(l.imei)).length;
+  if (!list.length) return retItemsHtml();
   const row = l => { const ok = got.has(l.imei); return `<div class="ri ${ok ? 'ok' : ''}"><span class="ck">${ok ? '✓' : ''}</span>
     <div class="grow"><b class="code">${esc(l.imei)}</b><small>${esc(l.model || '-')} · <span class="code">${esc(l.issue_doc)}</span>${l.last_note ? ` · <span class="warn-t">ค้างเพราะ: ${esc(l.last_note)}</span>` : ''}</small></div>
     ${ok ? `<button class="ghost" data-act="del" data-imei="${esc(l.imei)}" aria-label="ยกเลิกการยิง">✕</button>` : ''}</div>`; };
   return `<div class="retbar"><span>ยิงคืนแล้ว <b>${n}</b> / ${list.length} เครื่อง</span>${n === list.length && n ? '<span class="badge ok">ครบ</span>' : ''}</div>
     <div class="bar" style="margin:6px 0 10px"><i style="width:${list.length ? n / list.length * 100 : 0}%"></i></div>
-    <div class="retlist">${[...list.filter(l => !got.has(l.imei)), ...list.filter(l => got.has(l.imei))].map(row).join('')}</div>`;
+    <div class="retlist">${[...list.filter(l => !got.has(l.imei)), ...list.filter(l => got.has(l.imei))].map(row).join('')}</div>` + retItemsHtml();
 }
 function retSumHtml() {
-  const t = retLoans().length, n = state.cart.return.length;
-  return t ? `<span>${esc(state.retPerson)}</span><b>${n} / ${t} เครื่อง</b>` : '<span>ยังไม่ได้เลือกผู้เบิก</span><b>0 เครื่อง</b>';
+  const t = retLoans().length, n = state.cart.return.length, il = retILoans();
+  if (!state.retPerson || (!t && !il.length)) return '<span>ยังไม่ได้เลือกผู้เบิก</span><b>0</b>';
+  const ig = il.reduce((a, l) => a + Math.min(retIGot(l.id), ilRem(l)), 0), it = il.reduce((a, l) => a + ilRem(l), 0);
+  return `<span>${esc(state.retPerson)}</span><b>${[t && `${n} / ${t} เครื่อง`, it && `ของใช้ ${ig} / ${it}`].filter(Boolean).join(' · ')}</b>`;
 }
 let retSig = '';
-const retSignature = () => state.open.map(l => l.imei + '|' + l.person + '|' + (l.last_note || '')).sort().join(',');
+const retSignature = () => state.open.map(l => l.imei + '|' + l.person + '|' + (l.last_note || '')).sort().join(',') + '#' + state.iopen.map(l => [l.id, l.person, ilRem(l), l.last_note].join('|')).join(',');
 function refreshReturnInPlace() {
   if (!$('#retWho')) return render();
   const sig = retSignature(); if (sig === retSig) return; // ข้อมูลไม่เปลี่ยน → ไม่แตะหน้าจอเลย
   retSig = sig;
   if (state.retPerson && !retPeople().has(state.retPerson)) { state.retPerson = ''; state.cart.return = []; }
   state.cart.return = state.cart.return.filter(x => state.openMap.has(x.imei));
+  const ids = new Set(state.iopen.map(l => String(l.id))); Object.keys(state.retItems).forEach(k => { if (!ids.has(k)) delete state.retItems[k]; });
   renderRetAll();
 }
 function renderRet() {
@@ -526,27 +548,32 @@ const peopleOpts = () => peopleList().map(x => `<option value="${esc(x)}">`).joi
 /* ขอเบิก: เลือกรุ่น + จำนวน */
 // ป้ายจำนวนพร้อมเบิก = คงเหลือ − ที่คำขออื่นจองไว้ · ขอได้ไม่เกินจำนวนนี้
 const stockTag = id => { const n = availOf(id), a = state.avail.get(id);
-  return `<span class="stk-tag ${n <= 0 ? 'out' : n <= 3 ? 'low' : 'ok'}">${n <= 0 ? 'หมด' : 'พร้อมเบิก ' + num(n)}${n > 0 && n <= 3 ? ' · ใกล้หมด' : ''}</span>`
+  return `<span class="stk-tag ${n <= 0 ? 'out' : n <= 3 ? 'low' : 'ok'}">${n <= 0 ? 'หมด' : 'พร้อมเบิก ' + num(n) + (isItemM(id) ? ' ' + esc(unitOf(id)) : '')}${n > 0 && n <= 3 ? ' · ใกล้หมด' : ''}</span>`
     + (isIssuer() && a ? `<small class="stk-sub">คงเหลือ ${num(a.stock)}${a.reserved ? ` · จองแล้ว ${num(a.reserved)}` : ''}</small>` : ''); };
 function modelPickHtml() {
   const q = state.mq.trim().toLowerCase();
   const ms = state.models.filter(m => m.active);
   if (!ms.length) return `<div class="empty"><i>📦</i><b>ยังไม่มีรุ่นเครื่องให้เลือก</b><span>${isIssuer() ? 'เพิ่มรุ่นได้ที่เมนู “สต็อก”' : 'ติดต่อผู้จ่ายเบิกให้เพิ่มรุ่น'}</span></div>`;
   const list = ms.filter(m => !q || m.name.toLowerCase().includes(q) || state.req.qty[m.id]);
-  return list.sort((a, b) => (availOf(b.id) > 0) - (availOf(a.id) > 0)).map(m => { const n = state.req.qty[m.id] || 0, av = availOf(m.id); return `<div class="pick ${n ? 'on' : ''} ${av <= 0 && !n ? 'dis' : ''}" id="pk-${m.id}">
-    <div class="nm">${esc(m.name)}${stockTag(m.id)}</div>
-    <div class="step"><button data-act="qty" data-id="${m.id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="${av}" data-qty="${m.id}" value="${n || ''}" placeholder="0" ${av <= 0 && !n ? 'disabled' : ''} aria-label="จำนวน ${esc(m.name)}"><button data-act="qty" data-id="${m.id}" data-d="1" ${n >= av ? 'disabled' : ''} aria-label="เพิ่ม">+</button></div></div>`; }).join('')
-    || '<p class="muted center">ไม่พบรุ่นที่ค้นหา</p>';
+  const row = m => { const n = state.req.qty[m.id] || 0, av = availOf(m.id); return `<div class="pick ${n ? 'on' : ''} ${av <= 0 && !n ? 'dis' : ''}" id="pk-${m.id}">
+    <div class="nm">${esc(m.name)}${m.kind === 'item' ? ` <small class="unit-t">(${esc(m.unit)})</small>` : ''}${stockTag(m.id)}</div>
+    <div class="step"><button data-act="qty" data-id="${m.id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="${av}" data-qty="${m.id}" value="${n || ''}" placeholder="0" ${av <= 0 && !n ? 'disabled' : ''} aria-label="จำนวน ${esc(m.name)}"><button data-act="qty" data-id="${m.id}" data-d="1" ${n >= av ? 'disabled' : ''} aria-label="เพิ่ม">+</button></div></div>`; };
+  const srt = a => a.sort((a, b) => (availOf(b.id) > 0) - (availOf(a.id) > 0) || a.name.localeCompare(b.name, 'th'));
+  const dv = srt(list.filter(m => m.kind !== 'item')), it = srt(list.filter(m => m.kind === 'item'));
+  if (!dv.length && !it.length) return '<p class="muted center">ไม่พบรายการที่ค้นหา</p>';
+  const both = dv.length && it.length;
+  return (both ? '<div class="pk-h">📱 เครื่อง</div>' : '') + dv.map(row).join('') + (it.length ? '<div class="pk-h">🪑 ของใช้ / อุปกรณ์</div>' + it.map(row).join('') : '');
 }
 const reqLines = () => Object.entries(state.req.qty).filter(([id, n]) => n > 0 && state.modelMap.get(+id)?.active).map(([id, n]) => ({ model_id: +id, qty: n }));
 function reqSumHtml() {
   const l = reqLines(), t = l.reduce((a, x) => a + x.qty, 0);
-  return l.length ? `<span>${l.length} รุ่น</span><b>รวม ${t} เครื่อง</b>` : '<span>ยังไม่ได้เลือกรุ่น</span><b>0 เครื่อง</b>';
+  const dv = l.filter(x => !isItemM(x.model_id)).reduce((a, x) => a + x.qty, 0), it = t - dv;
+  return l.length ? `<span>${l.length} รายการ</span><b>${[dv && `${dv} เครื่อง`, it && `ของใช้ ${it}`].filter(Boolean).join(' · ')}</b>` : '<span>ยังไม่ได้เลือก</span><b>0</b>';
 }
 function setQty(id, n, syncInput = true) {
-  n = Math.max(0, Math.min(999, Math.floor(+n || 0)));
+  n = Math.max(0, Math.min(9999, Math.floor(+n || 0)));
   const av = availOf(+id);
-  if (id && n > av) { n = av; syncInput = true; toast(av > 0 ? `${mName(+id)} พร้อมเบิกได้สูงสุด ${av} เครื่อง` : `${mName(+id)} หมดแล้ว`, true); }
+  if (id && n > av) { n = av; syncInput = true; toast(av > 0 ? `${mName(+id)} พร้อมเบิกได้สูงสุด ${av} ${unitOf(id)}` : `${mName(+id)} หมดแล้ว`, true); }
   if (n) state.req.qty[id] = n; else delete state.req.qty[id];
   const row = $('#pk-' + id);
   if (row) { row.classList.toggle('on', n > 0); if (syncInput) row.querySelector('input').value = n || ''; const plus = row.querySelector('[data-d="1"]'); if (plus) plus.disabled = n >= av; }
@@ -563,8 +590,8 @@ function viewRequest() {
     <label>แผนก / งาน<input data-bind="req.dept" value="${esc(r.dept)}"></label>
     <label>วัตถุประสงค์การใช้<input data-bind="req.purpose" value="${esc(r.purpose)}"></label>
     <label style="margin-bottom:0">หมายเหตุ<input data-bind="req.note" value="${esc(r.note)}"></label></section>
-  <section class="card"><h2>เลือกรุ่นและจำนวน</h2>
-    <p class="hint">ขอได้ไม่เกินจำนวน “พร้อมเบิก” ของแต่ละรุ่น</p>
+  <section class="card"><h2>เลือกรุ่น / ของใช้ และจำนวน</h2>
+    <p class="hint">ขอได้ไม่เกินจำนวน “พร้อมเบิก” ของแต่ละรายการ</p>
     ${state.models.filter(m => m.active).length > 6 ? `<input data-bind="mq" placeholder="ค้นหารุ่น" value="${esc(state.mq)}" style="margin:0 0 6px">` : ''}
     <div id="modelPick">${modelPickHtml()}</div></section>
   <div class="cta"><div class="sum" id="reqSum">${reqSumHtml()}</div>
@@ -582,7 +609,7 @@ function reqListHtml() {
     <span class="badge ${REQ_CLS[r.status]}">${REQ_T[r.status]}</span> <b class="code">${esc(r.req_no)}</b>
     <small><b>${esc(r.person)}</b>${r.dept ? ' · ' + esc(r.dept) : ''} · ${fmt(r.created_at)}</small>
     <small>${reqSummary(r)}</small></div>
-    <div class="side"><b class="bignum">${r.status === 'ISSUED' ? reqIssued(r) + '<i>/' + reqQty(r) + '</i>' : reqQty(r)}</b><small>เครื่อง</small>
+    <div class="side"><b class="bignum">${r.status === 'ISSUED' ? reqIssued(r) + '<i>/' + reqQty(r) + '</i>' : reqQty(r)}</b><small>จำนวน</small>
     ${isIssuer() && r.status === 'PENDING' ? `<button class="primary sm" data-act="startFul" data-no="${esc(r.req_no)}">จ่าย</button>` : ''}</div></div></div>`).join('') + more;
 }
 const renderReqList = () => { const e = $('#reqList'); if (e) e.innerHTML = reqListHtml(); };
@@ -600,6 +627,11 @@ function fulLinesHtml() {
   const r = curReq(), f = state.ful;
   return r.request_items.map(l => {
     const n = fulCnt(l.model_id), m = state.modelMap.get(l.model_id), its = f.items.filter(x => x.model_id === l.model_id);
+    if (m?.kind === 'item') return `<div class="tile item-tile ${n >= l.qty ? 'done' : ''}">
+      <div class="tl"><b>🪑 ${esc(l.model)}</b><span class="cnt">${n}<i>/${l.qty} ${esc(m.unit)}</i></span></div>
+      <div class="bar"><i style="width:${Math.min(100, n / l.qty * 100)}%"></i></div>
+      <div class="step ful-step"><button data-act="fulQ" data-id="${l.model_id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="${l.qty}" data-fulq="${l.model_id}" value="${n || ''}" placeholder="0" aria-label="จำนวนจ่าย ${esc(l.model)}"><button data-act="fulQ" data-id="${l.model_id}" data-d="1" aria-label="เพิ่ม">+</button><button data-act="fulQ" data-id="${l.model_id}" data-d="all">ครบ</button></div>
+      <small class="${m.stock < l.qty ? 'warn-t' : 'muted'}">คงเหลือในคลัง ${num(m.stock)} ${esc(m.unit)} · ${m.returnable ? 'ต้องคืน' : 'ใช้แล้วหมด (ไม่ต้องคืน)'}</small></div>`;
     return `<div class="tile ${f.cur === l.model_id ? 'cur' : ''} ${n >= l.qty ? 'done' : ''}" data-act="setCur" data-id="${l.model_id}">
       <div class="tl"><b>${esc(l.model)}</b><span class="cnt">${n}<i>/${l.qty}</i></span></div>
       <div class="bar"><i style="width:${Math.min(100, n / l.qty * 100)}%"></i></div>
@@ -610,8 +642,9 @@ function fulLinesHtml() {
   }).join('');
 }
 function fulSumHtml() {
-  const r = curReq(); const t = reqQty(r), n = state.ful.items.length;
-  return `<span>สแกนแล้ว</span><b>${n} / ${t} เครื่อง</b>`;
+  const r = curReq(), dl = r.request_items.filter(l => !isItemM(l.model_id)), il = r.request_items.filter(l => isItemM(l.model_id));
+  const dt = dl.reduce((a, l) => a + l.qty, 0), it = il.reduce((a, l) => a + l.qty, 0), ni = il.reduce((a, l) => a + fulCnt(l.model_id), 0);
+  return `<span>จ่ายแล้ว</span><b>${[dt && `${state.ful.items.length} / ${dt} เครื่อง`, it && `ของใช้ ${ni} / ${it}`].filter(Boolean).join(' · ')}</b>`;
 }
 function renderFul() {
   const a = $('#fulLines'); if (a) a.innerHTML = fulLinesHtml();
@@ -624,19 +657,24 @@ function viewFulfill() {
   return errBanner() + back + `<section class="card"><h2>จ่ายตามคำขอ <span class="code">${esc(r.req_no)}</span></h2>
     <p style="margin:0"><b>${esc(r.person)}</b>${r.dept ? ' · ' + esc(r.dept) : ''}</p>
     <small>${fmt(r.created_at)}${r.purpose ? ' · ' + esc(r.purpose) : ''}${r.note ? ' · ' + esc(r.note) : ''}</small></section>
-  <section class="card"><h2>ยิง IMEI ได้เลย</h2>
-    <p class="hint">ยิงเครื่องไหนก็ได้ ไม่ต้องเรียงรุ่น — ระบบดูจาก IMEI ว่าเป็นรุ่นอะไร แล้วใส่ให้เอง · ยิงผิดรุ่นหรือเกินจำนวนระบบจะไม่รับ</p>
+  ${(() => { const hasDev = r.request_items.some(l => !isItemM(l.model_id)); return `<section class="card"><h2>${hasDev ? 'ยิง IMEI ได้เลย' : 'ใส่จำนวนที่จ่าย'}</h2>
+    <p class="hint">${hasDev ? 'ยิงเครื่องไหนก็ได้ ไม่ต้องเรียงรุ่น — ระบบดูจาก IMEI ว่าเป็นรุ่นอะไร แล้วใส่ให้เอง · ยิงผิดรุ่นหรือเกินจำนวนระบบจะไม่รับ' : ''}${r.request_items.some(l => isItemM(l.model_id)) ? `${hasDev ? '<br>' : ''}ของใช้ 🪑 ไม่ต้องยิง — ใส่จำนวนที่จ่ายจริง (ตั้งไว้ให้ตามคำขอแล้ว)` : ''}</p>
     <div id="fulLines">${fulLinesHtml()}</div>
-    <div style="margin-top:14px">${scanBox('ful')}</div></section>
+    ${hasDev ? `<div style="margin-top:14px">${scanBox('ful')}</div>` : ''}</section>`; })()}
   <div class="cta"><div class="sum" id="fulSum">${fulSumHtml()}</div>
-    <button class="primary big" data-act="commitFul">✅ ยืนยันจ่ายเครื่อง</button></div>`;
+    <button class="primary big" data-act="commitFul">✅ ยืนยันการจ่าย</button></div>`;
 }
 
 /* รับคืน: เลือกผู้เบิก → เห็น IMEI ทั้งหมด → ยิงอย่างเดียว */
 function retPeople() {
-  const by = new Map(); state.open.forEach(l => { const g = by.get(l.person) || { n: 0, oldest: l.issued_at }; g.n++; if (new Date(l.issued_at) < new Date(g.oldest)) g.oldest = l.issued_at; by.set(l.person, g); });
+  const by = new Map(), get = l => { const g = by.get(l.person) || { n: 0, it: 0, oldest: l.issued_at }; if (new Date(l.issued_at) < new Date(g.oldest)) g.oldest = l.issued_at; by.set(l.person, g); return g; };
+  state.open.forEach(l => { get(l).n++; });
+  state.iopen.forEach(l => { get(l).it += ilRem(l); });
   return by;
 }
+const retILoans = () => state.retPerson ? state.iopen.filter(l => l.person === state.retPerson) : [];
+const retIGot = id => Math.max(0, Math.floor(+state.retItems[id] || 0));
+const retIMissing = () => retILoans().filter(l => retIGot(l.id) < ilRem(l));
 // ผู้เบิก: เลือกแล้วโชว์ชื่อ + ปุ่มเปลี่ยน · ยังไม่เลือก โชว์การ์ดรายชื่อ (ปุ่มใหญ่ แตะง่าย ไม่ใช้ dropdown)
 function retWhoHtml() {
   const by = retPeople();
@@ -651,7 +689,7 @@ function plistHtml(by = retPeople()) {
   const q = state.retQ.trim().toLowerCase();
   const list = [...by].filter(([p]) => !q || p.toLowerCase().includes(q)).sort((a, b) => a[0].localeCompare(b[0], 'th'));
   return list.length ? list.map(([p, g]) => { const d = daysSince(g.oldest); return `<button class="pbtn" data-act="pickPerson" data-p="${esc(p)}">
-    <b>${esc(p)}</b><span><i>${g.n}</i> เครื่อง${d >= 7 ? ` · <em>${d} วัน</em>` : ''}</span></button>`; }).join('') : '<p class="muted center" style="margin:4px 0">ไม่พบชื่อ</p>';
+    <b>${esc(p)}</b><span>${[g.n && `<i>${g.n}</i> เครื่อง`, g.it && `ของใช้ <i>${num(g.it)}</i>`].filter(Boolean).join(' · ')}${d >= 7 ? ` · <em>${d} วัน</em>` : ''}</span></button>`; }).join('') : '<p class="muted center" style="margin:4px 0">ไม่พบชื่อ</p>';
 }
 function renderRetAll() {
   const w = $('#retWho'); if (w) w.innerHTML = retWhoHtml();
@@ -659,12 +697,12 @@ function renderRetAll() {
 }
 function viewReturn() {
   const by = retPeople();
-  if (state.retPerson && !by.has(state.retPerson)) { state.retPerson = ''; state.cart.return = []; }
+  if (state.retPerson && !by.has(state.retPerson)) { state.retPerson = ''; state.cart.return = []; state.retItems = {}; }
   retSig = retSignature();
   return errBanner() + `<section class="card"><h2>รับคืนเครื่อง</h2>
     <div id="retWho">${retWhoHtml()}</div>
     <label style="margin:12px 0 0">หมายเหตุ (เช่น สภาพเครื่อง)<input data-bind="rnote" value="${esc(state.rnote)}"></label></section>
-  <section class="card"><h2>ยิง IMEI ที่คืน</h2>${scanBox('return', false)}
+  <section class="card"><h2>ยิง IMEI ที่คืน${state.iopen.length ? ' / ใส่จำนวนของใช้' : ''}</h2>${scanBox('return', false)}
     <div id="retList" style="margin-top:12px">${retListHtml()}</div></section>
   <div class="cta"><div class="sum" id="retSum">${retSumHtml()}</div>
     <button class="primary big" data-act="commitReturn">✅ ยืนยันการรับคืน</button></div>`;
@@ -681,31 +719,40 @@ function outGroups() {
     if (l.last_note) g.notes++;
     if (q && [l.imei, l.model, l.person, l.dept, l.purpose, l.issue_doc, l.req_no].some(x => String(x || '').toLowerCase().includes(q))) g.hit = true;
   });
+  state.iopen.forEach(l => {
+    let g = map.get(l.person);
+    if (!g) map.set(l.person, g = { person: l.person, dept: l.dept, items: [], oldest: l.issued_at, docs: new Set(), models: new Map(), hit: !q, notes: 0 });
+    (g.its = g.its || []).push(l); g.docs.add(l.issue_doc);
+    if (new Date(l.issued_at) < new Date(g.oldest)) g.oldest = l.issued_at;
+    if (l.last_note) g.notes++;
+    if (q && [l.model, l.person, l.dept, l.purpose, l.issue_doc, l.req_no].some(x => String(x || '').toLowerCase().includes(q))) g.hit = true;
+  });
   return [...map.values()].filter(g => g.hit).sort((a, b) => new Date(a.oldest) - new Date(b.oldest));
 }
 function outListHtml() {
   const gs = outGroups();
   return gs.length ? gs.map(g => { const n = daysSince(g.oldest); return `<div class="card item doc t-ISSUE" data-act="personDlg" data-p="${esc(g.person)}"><div class="line" style="border:0;padding:0">
     <div class="grow"><b style="font-size:16.5px">${esc(g.person)}</b>${g.dept ? `<small>${esc(g.dept)}</small>` : ''}
-      <small>${[...g.models].map(([m, c]) => `${esc(m)} ×${c}`).join(' · ')}</small>
+      <small>${[...[...g.models].map(([m, c]) => `${esc(m)} ×${c}`), ...(g.its || []).map(l => `🪑 ${esc(l.model)} ${num(ilRem(l))} ${esc(l.unit)}`)].join(' · ')}</small>
       <small><span class="badge ${n >= 7 ? 'err' : 'warn'}">${n === 0 ? 'วันนี้' : 'นานสุด ' + n + ' วัน'}</span> · ${g.docs.size} ใบจ่าย${g.notes ? ` · <span class="warn-t">มีเหตุผลค้าง ${g.notes}</span>` : ''}</small></div>
-    <div class="side"><b class="bignum">${g.items.length}</b><small>เครื่อง</small>
+    <div class="side"><b class="bignum">${g.items.length || (g.its || []).reduce((a, l) => a + ilRem(l), 0)}</b><small>${g.items.length ? 'เครื่อง' : 'ของใช้'}</small>
       <button class="primary sm" data-act="retPerson" data-p="${esc(g.person)}">รับคืน</button></div></div></div>`; }).join('')
-    : '<div class="empty"><i>✅</i><b>ไม่มีเครื่องค้าง</b><span>ทุกเครื่องคืนครบแล้ว</span></div>';
+    : '<div class="empty"><i>✅</i><b>ไม่มีของค้าง</b><span>ทุกรายการคืนครบแล้ว</span></div>';
 }
 const renderOutList = () => { const e = $('#outList'); if (e) e.innerHTML = outListHtml(); };
 function viewOut() {
-  const people = new Set(state.open.map(l => l.person)).size;
+  const people = new Set([...state.open, ...state.iopen].map(l => l.person)).size, iq = state.iopen.reduce((a, l) => a + ilRem(l), 0);
   return errBanner() + `<input data-bind="outQ" placeholder="ค้นหา ผู้เบิก / IMEI / รุ่น / เลขที่เอกสาร" value="${esc(state.outQ)}" style="margin-bottom:10px">
-    <div class="stats"><div><b>${people}</b><small>ผู้เบิก</small></div><div><b>${num(state.open.length)}</b><small>เครื่องค้าง</small></div><div><b>${state.open.filter(l => daysSince(l.issued_at) >= 7).length}</b><small>เกิน 7 วัน</small></div></div>
+    <div class="stats"><div><b>${people}</b><small>ผู้เบิก</small></div><div><b>${num(state.open.length)}</b><small>เครื่องค้าง</small></div>${iq ? `<div><b>${num(iq)}</b><small>ของใช้ค้าง</small></div>` : `<div><b>${state.open.filter(l => daysSince(l.issued_at) >= 7).length}</b><small>เกิน 7 วัน</small></div>`}</div>
     <div class="row"><button data-act="reload">🔄 รีเฟรช</button><button data-act="exportCsv">⬇️ ส่งออก CSV</button></div>
     <div id="outList">${outListHtml()}</div>`;
 }
 function personDlg(p) {
-  const list = state.open.filter(l => l.person === p); if (!list.length) return;
-  showDialog(`<h2>${esc(p)} · ค้าง ${list.length} เครื่อง</h2>
-    <table><tr><th>IMEI</th><th>รุ่น</th><th class="r">วัน</th></tr>
-    ${list.map(l => `<tr><td>${esc(l.imei)}<small style="font-family:var(--f)">${esc(l.issue_doc)}${l.last_note ? ` · <span class="warn-t">${esc(l.last_note)}</span>` : ''}</small></td><td class="txt">${esc(l.model || '-')}</td><td class="r">${daysSince(l.issued_at)}</td></tr>`).join('')}</table>
+  const list = state.open.filter(l => l.person === p), il = state.iopen.filter(l => l.person === p); if (!list.length && !il.length) return;
+  showDialog(`<h2>${esc(p)} · ค้าง ${[list.length && list.length + ' เครื่อง', il.length && 'ของใช้ ' + il.length + ' รายการ'].filter(Boolean).join(' · ')}</h2>
+    ${il.length ? `<table style="margin-bottom:10px"><tr><th>ของใช้</th><th class="r">ค้าง</th><th class="r">วัน</th></tr>${il.map(l => `<tr><td class="txt">${esc(l.model)}<small>${esc(l.issue_doc)}${l.last_note ? ` · <span class="warn-t">${esc(l.last_note)}</span>` : ''}</small></td><td class="r">${num(ilRem(l))} ${esc(l.unit)}</td><td class="r">${daysSince(l.issued_at)}</td></tr>`).join('')}</table>` : ''}
+    ${list.length ? `<table><tr><th>IMEI</th><th>รุ่น</th><th class="r">วัน</th></tr>
+    ${list.map(l => `<tr><td>${esc(l.imei)}<small style="font-family:var(--f)">${esc(l.issue_doc)}${l.last_note ? ` · <span class="warn-t">${esc(l.last_note)}</span>` : ''}</small></td><td class="txt">${esc(l.model || '-')}</td><td class="r">${daysSince(l.issued_at)}</td></tr>`).join('')}</table>` : ''}
     <button class="primary big" data-act="retPerson" data-p="${esc(p)}">รับคืนจากคนนี้</button>
     <button class="big" data-act="closeDlg">ปิด</button>`);
 }
@@ -714,8 +761,17 @@ function personDlg(p) {
 function stockListHtml() {
   const q = state.sq.trim().toLowerCase();
   const out = new Map(); state.open.forEach(l => l.model_id && out.set(l.model_id, (out.get(l.model_id) || 0) + 1));
-  const list = state.models.filter(m => !q || m.name.toLowerCase().includes(q)).sort((a, b) => b.active - a.active || a.name.localeCompare(b.name, 'th'));
-  if (!list.length) return `<div class="empty"><b>${state.models.length ? 'ไม่พบรุ่นที่ค้นหา' : 'ยังไม่มีรุ่นเครื่อง'}</b>${state.models.length ? '' : '<span>เพิ่มรุ่นแรกได้จากฟอร์มด้านบน</span>'}</div>`;
+  const itm = state.stockTab === 'item', all = state.models.filter(m => (m.kind === 'item') === itm);
+  const list = all.filter(m => !q || m.name.toLowerCase().includes(q)).sort((a, b) => b.active - a.active || a.name.localeCompare(b.name, 'th'));
+  if (!list.length) return `<div class="empty"><b>${all.length ? 'ไม่พบที่ค้นหา' : itm ? 'ยังไม่มีของใช้' : 'ยังไม่มีรุ่นเครื่อง'}</b>${all.length ? '' : '<span>เพิ่มได้จากฟอร์มด้านบน</span>'}</div>`;
+  if (itm) { const iout = new Map(); state.iopen.forEach(l => iout.set(l.model_id, (iout.get(l.model_id) || 0) + ilRem(l)));
+    return list.map(m => { const a = state.avail.get(m.id) || {}, o = iout.get(m.id) || 0, res = a.reserved || 0;
+      return `<div class="card item stk ${m.active ? '' : 'off'}"><div class="line" style="border:0;padding:0">
+      <div class="grow"><b class="stk-name">🪑 ${esc(m.name)}</b> ${m.active ? '' : '<span class="badge">ปิดใช้งาน</span>'}
+        <div class="stk-split"><span class="${m.returnable ? 'ok' : 'warn'}">${m.returnable ? '↩ ต้องคืน' : '✓ ใช้แล้วหมด'}</span><span>หน่วย: ${esc(m.unit)}</span></div>
+        <small>${m.returnable ? `ถูกยืมอยู่ ${num(o)} ${esc(m.unit)}` : 'เบิกแล้วตัดสต็อกเลย'}${res ? ` · จองแล้ว ${num(res)}` : ''}${res > m.stock ? ' · <b style="color:var(--red)">ไม่พอจ่าย</b>' : ''}</small></div>
+      <div class="side"><b class="bignum ${m.stock <= 0 ? 'neg' : ''}">${num(m.stock)}</b><small>${esc(m.unit)} คงเหลือ</small></div></div>
+      <div class="row stk-act"><button class="primary" data-act="stockDlg" data-id="${m.id}">± รับเข้า / ตัดออก</button><button data-act="itemDlg" data-id="${m.id}" aria-label="แก้ไข">✎ แก้ไข</button></div></div>`; }).join(''); }
   return list.map(m => { const a = state.avail.get(m.id) || {}, o = out.get(m.id) || 0, reg = regOf(m.id), un = unregOf(m.id), res = a.reserved || 0;
     return `<div class="card item stk ${m.active ? '' : 'off'}"><div class="line" style="border:0;padding:0">
     <div class="grow"><b class="stk-name">${esc(m.name)}</b> ${m.active ? '' : '<span class="badge">ปิดใช้งาน</span>'}
@@ -728,10 +784,22 @@ function stockListHtml() {
 }
 const renderStockList = () => { const e = $('#stockList'); if (e) e.innerHTML = stockListHtml(); };
 function viewStock() {
-  const act = state.models.filter(m => m.active), tot = act.reduce((a, m) => a + m.stock, 0), reg = act.reduce((a, m) => a + regOf(m.id), 0);
-  return errBanner() + `<div class="row" style="margin:0 0 14px"><button class="primary big" data-act="rcvGo" style="margin:0;flex:3">📥 รับเข้าสต็อก (ยิง IMEI)</button><button class="big" data-view="import" style="margin:0;flex:2">📄 Excel</button></div>
+  const itm = state.stockTab === 'item', tabs = `<div class="seg stk-tabs"><button data-act="stockTab" data-t="device" class="${itm ? '' : 'on'}">📱 เครื่อง (IMEI)</button><button data-act="stockTab" data-t="item" class="${itm ? 'on' : ''}">🪑 ของใช้ / อุปกรณ์</button></div>`;
+  if (itm) { const its = state.models.filter(m => m.kind === 'item'), ni = state.newItem, out = state.iopen.reduce((a, l) => a + ilRem(l), 0);
+    return errBanner() + tabs + `<div class="stats"><div><b>${its.filter(m => m.active).length}</b><small>รายการ</small></div><div><b>${num(its.filter(m => m.active).reduce((a, m) => a + m.stock, 0))}</b><small>คงเหลือรวม</small></div><div><b>${num(out)}</b><small>ถูกยืมอยู่</small></div></div>
+    <details class="card" style="padding:12px 14px" ${its.length ? '' : 'open'}><summary style="cursor:pointer;font-weight:700">＋ เพิ่มของใช้ใหม่</summary>
+      <label style="margin:10px 0 8px">ชื่อ<input data-bind="newItem.name" value="${esc(ni.name)}" placeholder="เช่น เก้าอี้พับ, บูธ 3x3, โต๊ะ, ป้ายตั้ง"></label>
+      <div class="row" style="margin:0"><label style="margin:0">หน่วย<input data-bind="newItem.unit" value="${esc(ni.unit)}" placeholder="ตัว / ชุด / ใบ" list="units"></label>
+      <label style="margin:0">จำนวนตั้งต้น<input data-bind="newItem.qty" type="number" inputmode="numeric" min="0" value="${esc(ni.qty)}" placeholder="0"></label></div>
+      <datalist id="units">${['ตัว', 'ชุด', 'ชิ้น', 'ใบ', 'อัน', 'ม้วน', 'กล่อง', 'แผ่น'].map(u => `<option value="${u}">`).join('')}</datalist>
+      <div class="seg" style="margin:12px 0 0"><button data-act="niRet" data-v="1" class="${ni.ret ? 'on' : ''}">↩ ต้องคืน<br><small>เก้าอี้ บูธ โต๊ะ</small></button><button data-act="niRet" data-v="0" class="${ni.ret ? '' : 'on'}">✓ ใช้แล้วหมด<br><small>ถุง สติกเกอร์ ของแจก</small></button></div>
+      <button class="primary big" data-act="addItem">＋ เพิ่มของใช้</button></details>
+    <input data-bind="sq" placeholder="🔍 ค้นหาของใช้" value="${esc(state.sq)}" style="margin:0 0 12px">
+    <div id="stockList">${stockListHtml()}</div>`; }
+  const act = devModels().filter(m => m.active), tot = act.reduce((a, m) => a + m.stock, 0), reg = act.reduce((a, m) => a + regOf(m.id), 0);
+  return errBanner() + tabs + `<div class="row" style="margin:0 0 14px"><button class="primary big" data-act="rcvGo" style="margin:0;flex:3">📥 รับเข้าสต็อก (ยิง IMEI)</button><button class="big" data-view="import" style="margin:0;flex:2">📄 Excel</button></div>
   <div class="stats"><div><b>${num(tot)}</b><small>คงเหลือทั้งหมด</small></div><div><b>${num(reg)}</b><small>ลง IMEI แล้ว</small></div><div><b>${num(state.open.length)}</b><small>ถูกเบิกอยู่</small></div></div>
-  <details class="card" style="padding:12px 14px" ${state.models.length ? '' : 'open'}><summary style="cursor:pointer;font-weight:700">＋ เพิ่มรุ่นใหม่</summary>
+  <details class="card" style="padding:12px 14px" ${devModels().length ? '' : 'open'}><summary style="cursor:pointer;font-weight:700">＋ เพิ่มรุ่นใหม่</summary>
     <div class="row" style="margin:10px 0 0"><label style="flex:2;margin:0">ชื่อรุ่น<input data-bind="newModel" value="${esc(state.newModel)}" placeholder="เช่น iPhone 15 128GB"></label>
     <label style="margin:0">จำนวนตั้งต้น<input data-bind="newQty" type="number" inputmode="numeric" min="0" value="${esc(state.newQty)}" placeholder="0"></label></div>
     <small style="margin-top:6px">ใส่ 0 แล้วค่อยกด “รับเข้า IMEI” ได้ · จำนวนตั้งต้นนับเป็นของเดิมที่ยังไม่ลง IMEI</small>
@@ -753,13 +821,13 @@ function addRcv(raw) {
   return `✓ ${s} · ${mName(r.model_id)} (${r.items.length})`;
 }
 function rcvModelsHtml() {
-  const q = state.rcvQ.trim().toLowerCase(), ms = state.models.filter(m => m.active && (!q || m.name.toLowerCase().includes(q)));
+  const q = state.rcvQ.trim().toLowerCase(), ms = devModels().filter(m => m.active && (!q || m.name.toLowerCase().includes(q)));
   return ms.length ? ms.map(m => `<button class="pbtn" data-act="rcvModel" data-id="${m.id}"><b>${esc(m.name)}</b><span>คงเหลือ <i>${num(m.stock)}</i>${unregOf(m.id) ? ` · <em>ไม่ลง IMEI ${unregOf(m.id)}</em>` : ''}</span></button>`).join('')
     : '<p class="muted center" style="margin:4px 0">ไม่พบรุ่น — เพิ่มรุ่นที่หน้าสต็อก</p>';
 }
 function rcvTopHtml() {
   const r = state.rcv, m = state.modelMap.get(r.model_id);
-  if (!m) return `${state.models.filter(x => x.active).length > 8 ? `<input data-bind="rcvQ" placeholder="🔍 ค้นหารุ่น" value="${esc(state.rcvQ)}" autocomplete="off" style="margin:0 0 8px">` : ''}<div class="plist" id="rcvModels">${rcvModelsHtml()}</div>`;
+  if (!m) return `${devModels().filter(x => x.active).length > 8 ? `<input data-bind="rcvQ" placeholder="🔍 ค้นหารุ่น" value="${esc(state.rcvQ)}" autocomplete="off" style="margin:0 0 8px">` : ''}<div class="plist" id="rcvModels">${rcvModelsHtml()}</div>`;
   const un = unregOf(m.id);
   if (r.mode === 'register' && !un) r.mode = 'new';
   return `<div class="who"><div class="grow"><small>รุ่นที่รับเข้า</small><b>${esc(m.name)}</b><small>คงเหลือ ${num(m.stock)} · ลง IMEI แล้ว ${num(regOf(m.id))}${un ? ` · ยังไม่ลง ${num(un)}` : ''}</small></div><button data-act="rcvModel" data-id="">เปลี่ยนรุ่น</button></div>
@@ -788,7 +856,7 @@ function devEditDlg(imei, id) {
   const m = state.modelMap.get(+id);
   showDialog(`<h2>แก้ไข IMEI ในสต็อก</h2><p class="muted" style="margin-bottom:10px">เดิม: <b class="code">${esc(imei)}</b> · ${esc(m?.name || '')}</p>
     <label>เลข IMEI<input id="deImei" value="${esc(imei)}" inputmode="numeric" autocomplete="off" class="code"></label>
-    <label>รุ่น<select id="deModel">${state.models.filter(x => x.active || x.id === +id).map(x => `<option value="${x.id}" ${x.id === +id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
+    <label>รุ่น<select id="deModel">${devModels().filter(x => x.active || x.id === +id).map(x => `<option value="${x.id}" ${x.id === +id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
     <p class="hint" style="margin-top:-4px">ย้ายรุ่นแล้ว จำนวนสต็อกจะย้ายจากรุ่นเดิมไปรุ่นใหม่ 1 เครื่อง</p>
     <button class="primary big" data-act="devEditSave" data-imei="${esc(imei)}" data-id="${id}" style="margin-top:0">บันทึก</button>
     <div class="row" style="margin:10px 0 0"><button class="danger" data-act="devDelOne" data-imei="${esc(imei)}" data-id="${id}">🗑 ลบ (ลงผิด)</button><button data-act="imeiRemove" data-imei="${esc(imei)}" data-id="${id}">📤 ตัดออก (เสีย/หาย)</button></div>
@@ -821,7 +889,7 @@ function imeiDlg(id) {
 /* ---------- นำเข้า/ส่งออกตาราง IMEI (Excel) ---------- */
 const tplTotal = () => Object.values(state.tpl).reduce((a, n) => a + n, 0) + state.tplNew.reduce((a, r) => a + r.qty, 0);
 function tplListHtml() {
-  const ms = state.models.filter(m => m.active);
+  const ms = devModels().filter(m => m.active);
   return (ms.length ? ms.map(m => { const n = state.tpl[m.id] || 0; return `<div class="pick ${n ? 'on' : ''}" id="tp-${m.id}"><div class="nm">${esc(m.name)}<small class="stk-sub">คงเหลือ ${num(m.stock)}${unregOf(m.id) ? ` · ยังไม่ลง IMEI ${unregOf(m.id)}` : ''}</small></div>
     <div class="step"><button data-act="tplQty" data-id="${m.id}" data-d="-1" aria-label="ลด">−</button><input type="number" inputmode="numeric" min="0" max="2000" data-tpl="${m.id}" value="${n || ''}" placeholder="0"><button data-act="tplQty" data-id="${m.id}" data-d="1" aria-label="เพิ่ม">+</button></div></div>`; }).join('') : '')
     + state.tplNew.map((r, i) => `<div class="pick on"><div class="nm">${esc(r.name)} <span class="badge pri">รุ่นใหม่</span></div><b class="bignum" style="font-size:18px">${r.qty}</b><button class="ghost" data-act="tplNewDel" data-i="${i}" aria-label="ลบ">✕</button></div>`).join('')
@@ -836,7 +904,7 @@ function exportTemplate() {
   state.models.filter(m => state.tpl[m.id] > 0).forEach(m => add(m.name, state.tpl[m.id]));
   state.tplNew.forEach(r => add(r.name, r.qty));
   for (let i = 0; i < (k ? 10 : 50); i++) rows.push([{ v: ++k, s: 2, n: 1 }, T(''), I(), T('')]); // แถวว่างเผื่อเพิ่มเอง
-  const names = [...state.models.filter(m => m.active).map(m => m.name), ...state.tplNew.map(r => r.name)];
+  const names = [...devModels().filter(m => m.active).map(m => m.name), ...state.tplNew.map(r => r.name)];
   const guide = [[{ v: 'วิธีใช้ตารางรับเข้าสต็อก', s: 4 }], [], ...[
     '1) กรอก IMEI ในคอลัมน์ C (ช่องสีเหลือง) ทีละ 1 เครื่องต่อ 1 แถว — ยิงบาร์โค้ดลงช่องได้เลย',
     '2) คอลัมน์ B คือรุ่น ต้องตรงกับชื่อรุ่นในระบบ (เลือกจากรายการได้) · ใส่ชื่อรุ่นใหม่ได้ ระบบจะถามก่อนสร้าง',
@@ -937,7 +1005,7 @@ function actEditDlg(id) {
   const a = state.acts.find(x => x.id === +id); if (!a) return;
   showDialog(`<h2>แก้ไข Activate</h2><p class="code" style="font-size:15px;margin-bottom:10px">${esc(a.imei)}</p>
     <label>วันเวลา Activate<input id="aeAt" type="datetime-local" value="${toLocalDT(a.activated_at)}" max="${toLocalDT(new Date())}"></label>
-    <label>รุ่น<input id="aeModel" list="actModels2" value="${esc(a.model)}"></label><datalist id="actModels2">${state.models.map(m => `<option value="${esc(m.name)}">`).join('')}</datalist>
+    <label>รุ่น<input id="aeModel" list="actModels2" value="${esc(a.model)}"></label><datalist id="actModels2">${devModels().map(m => `<option value="${esc(m.name)}">`).join('')}</datalist>
     <label>สี<input id="aeColor" value="${esc(a.color)}"></label>
     <label>หมายเหตุ<input id="aeNote" value="${esc(a.note || '')}"></label>
     <button class="primary big" data-act="actEditSave" data-id="${a.id}" style="margin-top:0">บันทึก</button>
@@ -952,7 +1020,7 @@ function actFormHtml() {
       <button data-act="scan" data-k="act" style="flex:0 0 auto" aria-label="สแกนด้วยกล้อง">📷</button></div></label>
     <div id="actInfo">${f.info}</div>
     <label>รุ่น *<input id="actModel" list="actModels" value="${esc(f.model)}" placeholder="ระบบเติมให้ถ้า IMEI อยู่ในสต็อก" autocomplete="off"></label>
-    <datalist id="actModels">${state.models.map(m => `<option value="${esc(m.name)}">`).join('')}</datalist>
+    <datalist id="actModels">${devModels().map(m => `<option value="${esc(m.name)}">`).join('')}</datalist>
     <label>สี *<input id="actColor" list="actColors" value="${esc(f.color)}" placeholder="เช่น ดำ / ขาว / Titanium Blue" autocomplete="off"></label>
     <datalist id="actColors">${colors.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
     ${colors.length ? `<div class="chips" style="margin:-4px 0 12px">${colors.map(c => `<button class="rchip" data-act="actColor" data-v="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : ''}
@@ -967,7 +1035,7 @@ function actFormHtml() {
 function actSummaryHtml() {
   const today = todayISO(), cnt = new Map();
   state.acts.forEach(a => { const g = cnt.get(a.model) || { n: 0, t: 0 }; g.n++; if (new Date(a.activated_at).toLocaleDateString('sv-SE') === today) g.t++; cnt.set(a.model, g); });
-  if (!state.pub) state.models.filter(m => m.active).forEach(m => { if (!cnt.has(m.name)) cnt.set(m.name, { n: 0, t: 0 }); });
+  if (!state.pub) devModels().filter(m => m.active).forEach(m => { if (!cnt.has(m.name)) cnt.set(m.name, { n: 0, t: 0 }); });
   const rows = [...cnt].sort((a, b) => a[0].localeCompare(b[0], 'th'));
   if (!rows.length) return '<p class="muted center" style="margin:0">ยังไม่มีรายการ</p>';
   return `<table class="sum-t"><thead><tr><th>รุ่น</th><th class="r">Activated</th><th class="r">วันนี้</th></tr></thead><tbody>
@@ -1105,13 +1173,14 @@ function renderPublic() {
 }
 
 /* ประวัติเอกสาร */
-const docSummary = d => { const n = d.document_items.length, f = d.document_items[0]; return (n ? `${esc(f.model ? f.model + ' · ' : '')}${esc(f.imei)}${n > 1 ? ` และอีก ${n - 1} เครื่อง` : ''}` : '') + (d.sold?.length ? `${n ? ' · ' : ''}ขาย ${d.sold.length} เครื่อง` : ''); };
+const docDev = d => d.document_items.filter(i => i.imei), docItm = d => d.document_items.filter(i => !i.imei);
+const docSummary = d => { const dv = docDev(d), n = dv.length, f = dv[0], it = docItm(d); return [n ? `${esc(f.model ? f.model + ' · ' : '')}${esc(f.imei)}${n > 1 ? ` และอีก ${n - 1} เครื่อง` : ''}` : '', ...it.map(i => `🪑 ${esc(i.model)} ×${num(i.qty)}`)].filter(Boolean).join(' · ') + (d.sold?.length ? `${n ? ' · ' : ''}ขาย ${d.sold.length} เครื่อง` : ''); };
 function historyListHtml() {
   const q = state.hq.trim().toLowerCase(), t = state.ht;
   const list = state.docs.filter(d => (!t || d.type === t) && (!q || [d.doc_no, d.req_no, d.person, d.dept, d.purpose, d.note, ...d.document_items.flatMap(i => [i.imei, i.model])].some(x => String(x || '').toLowerCase().includes(q))));
   const html = list.length ? list.map(d => {
     let st = '';
-    if (d.type === 'ISSUE') { const n = d.document_items.filter(i => state.openMap.get(i.imei)?.issue_doc === d.doc_no).length; st = `<span class="badge ${n ? 'warn' : 'ok'}">${n ? 'ค้าง ' + n : 'คืนครบ'}</span>`; }
+    if (d.type === 'ISSUE') { const n = docDev(d).filter(i => state.openMap.get(i.imei)?.issue_doc === d.doc_no).length + state.iopen.filter(l => l.issue_doc === d.doc_no).reduce((a, l) => a + ilRem(l), 0); st = `<span class="badge ${n ? 'warn' : 'ok'}">${n ? 'ค้าง ' + n : 'คืนครบ'}</span>`; }
     return `<div class="card item doc t-${d.type}" data-act="viewDoc" data-no="${esc(d.doc_no)}"><div class="line" style="border:0;padding:0"><div class="grow">
       <span class="badge ${DOC_CLS[d.type]}">${DOC_T[d.type]}</span> <b class="code">${esc(d.doc_no)}</b>
       <small>${fmt(d.created_at)} · ${esc(d.person || '-')}${d.dept ? ' · ' + esc(d.dept) : ''}</small><small>${docSummary(d)}</small></div>${st}</div></div>`;
@@ -1268,53 +1337,61 @@ function startFul(no) {
   const r = state.reqs.find(x => x.req_no === no);
   if (!r || r.status !== 'PENDING') return toast('คำขอนี้ไม่ได้รอจ่ายแล้ว', true);
   if (state.ful && state.ful.no !== no && state.ful.items.length && !confirm(`มีรายการสแกนค้างของคำขอ ${state.ful.no} (${state.ful.items.length} เครื่อง) — ทิ้งแล้วเริ่มคำขอนี้?`)) return;
-  if (!state.ful || state.ful.no !== no) state.ful = { no, items: [], cur: r.request_items[0]?.model_id };
+  if (!state.ful || state.ful.no !== no) state.ful = { no, items: [], cur: r.request_items.find(l => !isItemM(l.model_id))?.model_id,
+    qty: Object.fromEntries(r.request_items.filter(l => isItemM(l.model_id)).map(l => [l.model_id, Math.max(0, Math.min(l.qty, state.modelMap.get(l.model_id)?.stock || 0))])) };
   saveDraft(); if (dlg().open) dlg().close(); go('fulfill');
 }
 const commitFul = () => guarded(async () => {
   const r = curReq(), f = state.ful;
   if (!r) return;
-  if (!f.items.length) return toast('ยังไม่ได้สแกนเครื่อง', true);
+  const iq = r.request_items.filter(l => isItemM(l.model_id)).map(l => ({ model_id: l.model_id, qty: f.qty?.[l.model_id] || 0 })).filter(x => x.qty > 0);
+  const got = f.items.length + iq.reduce((a, x) => a + x.qty, 0);
+  if (!got) return toast('ยังไม่ได้สแกนเครื่อง / ใส่จำนวน', true);
   const t = reqQty(r);
-  if (f.items.length < t && !confirm(`จ่าย ${f.items.length} จาก ${t} เครื่อง (ไม่ครบตามคำขอ)\nคำขอจะถูกปิดเป็น “จ่ายแล้ว” — ยืนยัน?`)) return;
+  if (got < t && !confirm(`จ่าย ${got} จาก ${t} (ไม่ครบตามคำขอ)\nคำขอจะถูกปิดเป็น “จ่ายแล้ว” — ยืนยัน?`)) return;
   let doc;
-  try { doc = await rpc('req_fulfill', { p_req_no: r.req_no, p_by: opName(), p_items: f.items }); }
+  try { doc = await rpc('req_fulfill', { p_req_no: r.req_no, p_by: opName(), p_items: [...f.items, ...iq] }); }
   catch (e) { await refresh(); renderFul(); throw e; }
   state.ful = null; saveDraft();
   await refresh(); state.view = 'requests'; render(); toast('บันทึกการจ่าย ' + doc); showDoc(doc);
 });
 const REASONS = ['ผู้เบิกยังใช้งานอยู่', 'ยังไม่ได้นำมาคืน', 'ส่งซ่อม', 'เครื่องเสียหาย', 'สูญหาย'];
-let retSold = new Set(), retReason = '';
+let retSold = new Set(), retLost = new Set(), retReason = '';
 function commitReturn() {
   if (!state.retPerson) return toast('เลือกผู้เบิก หรือยิง IMEI ก่อน', true);
-  const miss = retMissing();
-  if (!miss.length) return doReturn([], '', []);
-  retSold = new Set(); retReason = '';
+  const miss = retMissing(), imiss = retIMissing();
+  retSold = new Set(); retLost = new Set(); retReason = '';
+  if (!miss.length && !imiss.length) return doReturn([], '', []);
   renderMissDlg();
 }
 // แต่ละเครื่องที่ไม่ได้ยิง: กด “ขาย” = ปิดรายการ ไม่คืนสต็อก · ที่เหลือ = ยังค้าง ต้องมีเหตุผล
 function renderMissDlg() {
   const reasonEl = $('#missReason'); if (reasonEl) retReason = reasonEl.value;
   const miss = retMissing(), sold = miss.filter(l => retSold.has(l.imei)), keep = miss.filter(l => !retSold.has(l.imei));
-  const n = state.cart.return.length;
-  const parts = [n && `คืน ${n}`, sold.length && `ขาย ${sold.length}`, keep.length && `ค้างต่อ ${keep.length}`].filter(Boolean).join(' · ');
-  showDialog(`<h2>ไม่ได้ยิงคืน ${miss.length} เครื่อง</h2>
-    <p class="muted" style="margin-bottom:8px">${esc(state.retPerson)} — เครื่องที่ <b>ขายแล้ว</b> กด “ขาย” (ไม่ต้องยิง และไม่คืนเข้าสต็อก) · ที่เหลือจะค้างต่อ ต้องใส่เหตุผล</p>
+  const imiss = retIMissing(), ikeep = imiss.filter(l => !retLost.has(l.id));
+  const n = state.cart.return.length, ni = retILoans().reduce((a, l) => a + Math.min(retIGot(l.id), ilRem(l)), 0);
+  const parts = [n && `คืน ${n} เครื่อง`, ni && `คืนของใช้ ${ni}`, sold.length && `ขาย ${sold.length}`, retLost.size && `ไม่คืน ${retLost.size} รายการ`, (keep.length || ikeep.length) && `ค้างต่อ ${keep.length + ikeep.length} รายการ`].filter(Boolean).join(' · ');
+  showDialog(`<h2>${miss.length ? `ไม่ได้ยิงคืน ${miss.length} เครื่อง` : 'ของใช้ยังคืนไม่ครบ'}</h2>
+    ${miss.length ? `<p class="muted" style="margin-bottom:8px">${esc(state.retPerson)} — เครื่องที่ <b>ขายแล้ว</b> กด “ขาย” (ไม่ต้องยิง และไม่คืนเข้าสต็อก) · ที่เหลือจะค้างต่อ ต้องใส่เหตุผล</p>
     <div class="misslist">${miss.map(l => { const on = retSold.has(l.imei); return `<div class="mrow ${on ? 'sold' : ''}"><div class="grow"><b class="code">${esc(l.imei)}</b><small>${esc(l.model || '-')}</small></div>
       <button class="soldbtn ${on ? 'on' : ''}" data-act="toggleSold" data-imei="${esc(l.imei)}">${on ? '✓ ขายแล้ว' : 'ขาย?'}</button></div>`; }).join('')}</div>
-    ${miss.length > 1 ? `<button data-act="soldAll" style="width:100%;margin-top:8px">${sold.length === miss.length ? 'ยกเลิกขายทั้งหมด' : `ขายทั้งหมด ${miss.length} เครื่อง`}</button>` : ''}
-    ${keep.length ? `<label style="margin-top:12px">เหตุผลของเครื่องที่ยังค้าง (${keep.length} เครื่อง) *<input id="missReason" value="${esc(retReason)}" placeholder="เช่น ผู้เบิกยังใช้งานอยู่" autocomplete="off"></label>
-    <div class="chips" style="margin:-4px 0 12px">${REASONS.map(r => `<button class="rchip" data-act="pickReason" data-v="${esc(r)}">${esc(r)}</button>`).join('')}</div>` : '<div style="height:12px"></div>'}
+    ${miss.length > 1 ? `<button data-act="soldAll" style="width:100%;margin-top:8px">${sold.length === miss.length ? 'ยกเลิกขายทั้งหมด' : `ขายทั้งหมด ${miss.length} เครื่อง`}</button>` : ''}` : ''}
+    ${imiss.length ? `<p class="muted" style="margin:${miss.length ? 14 : 0}px 0 8px">🪑 ของใช้ที่คืนไม่ครบ — ถ้า <b>เสีย / หาย / ใช้หมด</b> กด “ไม่คืนแล้ว” เพื่อปิดรายการ · ที่เหลือค้างต่อ</p>
+    <div class="misslist">${imiss.map(l => { const on = retLost.has(l.id), left = ilRem(l) - Math.min(retIGot(l.id), ilRem(l)); return `<div class="mrow ${on ? 'sold' : ''}"><div class="grow"><b>${esc(l.model)}</b><small>ยังไม่คืน ${num(left)} ${esc(l.unit)}</small></div>
+      <button class="soldbtn ${on ? 'on' : ''}" data-act="toggleLost" data-id="${l.id}">${on ? '✓ ไม่คืนแล้ว' : 'ไม่คืนแล้ว?'}</button></div>`; }).join('')}</div>` : ''}
+    ${keep.length || ikeep.length || retLost.size ? `<label style="margin-top:12px">เหตุผล${keep.length || ikeep.length ? `ที่ยังค้าง (${keep.length + ikeep.length} รายการ)` : 'ที่ไม่คืน'} *<input id="missReason" value="${esc(retReason)}" placeholder="เช่น ผู้เบิกยังใช้งานอยู่" autocomplete="off"></label>
+    <div class="chips" style="margin:-4px 0 12px">${(keep.length || ikeep.length ? REASONS : ['เสียหาย', 'สูญหาย', 'ใช้หมดแล้ว']).map(r => `<button class="rchip" data-act="pickReason" data-v="${esc(r)}">${esc(r)}</button>`).join('')}</div>` : '<div style="height:12px"></div>'}
     <button class="primary big" data-act="confirmReturn" style="margin-top:0">ยืนยัน: ${parts || '-'}</button>
     <button class="big" data-act="closeDlg">กลับไปยิงต่อ</button>`);
 }
 const doReturn = (missing, reason, sold) => guarded(async () => {
   const cart = state.cart.return;
   let doc;
-  try { doc = await rpc('dev_return', { p_imeis: cart.map(l => l.imei), p_by: opName(), p_note: state.rnote.trim(), p_missing: missing, p_reason: reason, p_sold: sold }); }
+  const items = retILoans().map(l => { const g = Math.min(retIGot(l.id), ilRem(l)); return { id: l.id, ret: g, lost: retLost.has(l.id) ? ilRem(l) - g : 0 }; });
+  try { doc = await rpc('dev_return', { p_imeis: cart.map(l => l.imei), p_by: opName(), p_note: state.rnote.trim(), p_missing: missing, p_reason: reason, p_sold: sold, p_items: items }); }
   catch (e) { await refresh(); renderRet(); throw e; }
   if (dlg().open) dlg().close();
-  state.cart.return = []; state.rnote = ''; state.retPerson = ''; saveDraft();
+  state.cart.return = []; state.retItems = {}; state.rnote = ''; state.retPerson = ''; saveDraft();
   await refresh(); render(); toast('บันทึกแล้ว ' + doc); showDoc(doc);
 });
 
@@ -1345,7 +1422,7 @@ function showReq(no) {
 }
 async function getDoc(no) {
   const d = state.docs.find(x => x.doc_no === no); if (d) return d;
-  const { data, error } = await sb.from('documents').select('*, document_items(imei, model)').eq('doc_no', no).maybeSingle();
+  const { data, error } = await sb.from('documents').select('*, document_items(imei, model, qty)').eq('doc_no', no).maybeSingle();
   if (error) throw error; return data;
 }
 async function showDoc(no) {
@@ -1355,19 +1432,22 @@ async function showDoc(no) {
   showDialog(`<h2>${iss ? 'ใบจ่าย' : 'ใบคืน'} · ${esc(d.doc_no)}</h2>
     <p>วันที่: ${fmt(d.created_at)}<br>${iss ? 'ผู้เบิก' : 'ผู้คืน'}: <b>${esc(d.person || '-')}</b>${d.dept ? '<br>แผนก/งาน: ' + esc(d.dept) : ''}
     ${d.purpose ? '<br>วัตถุประสงค์: ' + esc(d.purpose) : ''}${d.note ? '<br>หมายเหตุ: ' + esc(d.note) : ''}${d.req_no ? '<br>อ้างอิงคำขอ: <span class="code">' + esc(d.req_no) + '</span>' : ''}<br>บันทึกโดย: ${esc(d.by_name || '-')}</p>
-    <table><tr><th>IMEI</th><th>รุ่น</th>${iss && isIssuer() ? '<th class="r">สถานะ</th>' : ''}</tr>
-    ${d.document_items.map(i => `<tr><td>${esc(i.imei)}</td><td>${esc(i.model || '-')}</td>${iss && isIssuer() ? `<td class="r">${state.openMap.get(i.imei)?.issue_doc === d.doc_no ? '<span class="badge warn">ค้าง</span>' : '<span class="badge ok">คืนแล้ว</span>'}</td>` : ''}</tr>`).join('')}</table>
-    <p class="muted" style="margin-top:8px">รวม ${d.document_items.length} เครื่อง</p>
+    ${docDev(d).length ? `<table><tr><th>IMEI</th><th>รุ่น</th>${iss && isIssuer() ? '<th class="r">สถานะ</th>' : ''}</tr>
+    ${docDev(d).map(i => `<tr><td>${esc(i.imei)}</td><td>${esc(i.model || '-')}</td>${iss && isIssuer() ? `<td class="r">${state.openMap.get(i.imei)?.issue_doc === d.doc_no ? '<span class="badge warn">ค้าง</span>' : '<span class="badge ok">คืนแล้ว</span>'}</td>` : ''}</tr>`).join('')}</table>
+    <p class="muted" style="margin-top:8px">รวม ${docDev(d).length} เครื่อง</p>` : ''}
+    ${docItm(d).length ? `<table style="margin-top:8px"><tr><th>ของใช้</th><th class="r">จำนวน</th>${iss && isIssuer() ? '<th class="r">สถานะ</th>' : ''}</tr>
+    ${docItm(d).map(i => { const l = state.iopen.find(x => x.issue_doc === d.doc_no && x.model === i.model), u = unitByName(i.model); return `<tr><td class="txt">🪑 ${esc(i.model)}</td><td class="r">${num(i.qty)} ${esc(u)}</td>${iss && isIssuer() ? `<td class="r">${l ? `<span class="badge warn">ค้าง ${num(ilRem(l))}</span>` : `<span class="badge ok">${state.models.find(m => m.name === i.model)?.returnable === false ? 'ใช้หมด' : 'คืนแล้ว'}</span>`}</td>` : ''}</tr>`; }).join('')}</table>` : ''}
     ${d.sold?.length ? `<div class="missbox sold"><b>ขายแล้ว ${d.sold.length} เครื่อง</b> (ปิดรายการ ไม่คืนสต็อก)<div class="chips">${d.sold.map(m => `<span class="chip" style="padding-right:8px">${esc(m.imei)}</span>`).join('')}</div></div>` : ''}
     ${d.missing?.length ? `<div class="missbox"><b>ยังไม่คืน ${d.missing.length} เครื่อง</b> — เหตุผล: ${esc(d.missing_reason)}<div class="chips">${d.missing.map(m => `<span class="chip" style="padding-right:8px">${esc(m.imei)}</span>`).join('')}</div></div>` : ''}
-    <div class="row" style="margin-top:12px"><button data-act="printDoc" data-no="${esc(d.doc_no)}" data-mode="table">🖨️ พิมพ์ทั้งใบ</button><button data-act="printDoc" data-no="${esc(d.doc_no)}" data-mode="slip">🖨️ แยกทีละเครื่อง</button></div>
+    <div class="row" style="margin-top:12px"><button data-act="printDoc" data-no="${esc(d.doc_no)}" data-mode="table">🖨️ พิมพ์ทั้งใบ</button>${docDev(d).length ? `<button data-act="printDoc" data-no="${esc(d.doc_no)}" data-mode="slip">🖨️ แยกทีละเครื่อง</button>` : ''}</div>
     <button class="primary big" data-act="closeDlg" style="margin-top:0">ปิด</button>`);
 }
 function stockDlg(id) {
   const m = state.modelMap.get(+id); if (!m) return;
-  showDialog(`<h2>ปรับสต็อก · ${esc(m.name)}</h2>
-    <p>คงเหลือปัจจุบัน <b class="bignum">${num(m.stock)}</b> เครื่อง</p>
-    <p class="hint">ใช้กับเครื่องที่<b>ยังไม่ลง IMEI</b> · เครื่องที่มี IMEI ให้รับเข้า/ตัดออกด้วยการยิง IMEI</p>
+  const itm = m.kind === 'item';
+  showDialog(`<h2>${itm ? 'รับเข้า / ตัดออก' : 'ปรับสต็อก'} · ${esc(m.name)}</h2>
+    <p>คงเหลือปัจจุบัน <b class="bignum">${num(m.stock)}</b> ${esc(itm ? m.unit : 'เครื่อง')}</p>
+    ${itm ? '' : '<p class="hint">ใช้กับเครื่องที่<b>ยังไม่ลง IMEI</b> · เครื่องที่มี IMEI ให้รับเข้า/ตัดออกด้วยการยิง IMEI</p>'}
     <label>จำนวน<input id="adjQty" type="number" inputmode="numeric" min="0" placeholder="0"></label>
     <label>หมายเหตุ (เช่น รับเข้าจากซัพพลายเออร์, ตรวจนับประจำเดือน)<input id="adjNote"></label>
     <div class="row"><button class="primary" data-act="adjust" data-id="${m.id}" data-mode="add">＋ รับเข้า</button><button data-act="adjust" data-id="${m.id}" data-mode="sub">− ตัดออก</button></div>
@@ -1380,6 +1460,16 @@ function stockDlg(id) {
     box.innerHTML = error ? `<p class="badge err">${esc(errMsg(error))}</p>` : !data.length ? '<p class="muted">ยังไม่มีรายการ</p>'
       : `<table><tr><th>วันที่</th><th>รายการ</th><th class="r">±</th><th class="r">คงเหลือ</th></tr>${data.map(x => `<tr><td>${fmt(x.created_at)}</td><td class="txt">${MOVE_T[x.reason] || x.reason}${x.ref ? ` <span class="code">${esc(x.ref)}</span>` : ''}${x.note ? `<small>${esc(x.note)}</small>` : ''}</td><td class="r" style="color:${x.delta < 0 ? 'var(--red)' : 'var(--grn)'}">${x.delta > 0 ? '+' : ''}${x.delta}</td><td class="r">${x.balance ?? ''}</td></tr>`).join('')}</table>`;
   });
+}
+function itemDlg(id) {
+  const m = state.modelMap.get(+id); if (!m) return;
+  showDialog(`<h2>แก้ไขของใช้</h2>
+    <label>ชื่อ<input id="iName" value="${esc(m.name)}"></label>
+    <label>หน่วย<input id="iUnit" value="${esc(m.unit)}" list="units2"></label><datalist id="units2">${['ตัว', 'ชุด', 'ชิ้น', 'ใบ', 'อัน', 'ม้วน', 'กล่อง', 'แผ่น'].map(u => `<option value="${u}">`).join('')}</datalist>
+    <label class="chk"><input type="checkbox" id="iRet" ${m.returnable ? 'checked' : ''}> ต้องคืน (ติดตามในหน้า “ค้างอยู่” และรับคืนได้)</label>
+    <label class="chk" style="margin-top:8px"><input type="checkbox" id="iActive" ${m.active ? 'checked' : ''}> เปิดใช้งาน (แสดงให้ผู้เบิกเลือก)</label>
+    <p class="hint" style="margin-top:8px">เปลี่ยน “ต้องคืน” มีผลกับการเบิกครั้งต่อไป — ที่ยืมไปแล้วยังต้องคืนตามเดิม</p>
+    <button class="primary big" data-act="saveItem" data-id="${m.id}">บันทึก</button><button class="big" data-act="closeDlg">ยกเลิก</button>`);
 }
 function modelDlg(id) {
   const m = state.modelMap.get(+id); if (!m) return;
@@ -1520,8 +1610,14 @@ async function printDoc(no, mode = 'table') {
   const w = openWin(); if (!w) return;
   let d; try { d = await getDoc(no); } catch (e) { w.close(); return toast(errMsg(e), true); }
   if (!d) { w.close(); return toast('ไม่พบเอกสาร', true); }
-  const iss = d.type === 'ISSUE', title = iss ? 'ใบจ่ายเครื่อง' : 'ใบรับคืนเครื่อง', en = iss ? 'Device Issue Note' : 'Device Return Note';
-  const items = [...d.document_items].sort((a, b) => (a.model || '').localeCompare(b.model || '', 'th')), n = items.length;
+  const its = docItm(d), hasDev = docDev(d).length > 0;
+  const iss = d.type === 'ISSUE', what = !its.length ? 'เครื่อง' : hasDev ? 'เครื่องและอุปกรณ์' : 'อุปกรณ์';
+  const title = iss ? 'ใบจ่าย' + what : 'ใบรับคืน' + what, en = (iss ? 'Issue Note' : 'Return Note');
+  const itTbl = its.length ? `<div class="grp2" style="margin-top:10px"><div class="gh"><b>ของใช้ / อุปกรณ์</b><span>${its.length} รายการ</span></div></div>
+    <table><thead><tr><th class="n">#</th><th>รายการ</th><th style="width:16%;text-align:right">จำนวน</th><th style="width:12%">หน่วย</th><th style="width:30%">สภาพ / หมายเหตุ</th></tr></thead><tbody>
+    ${its.map((i, k) => `<tr><td class="n">${String(k + 1).padStart(2, '0')}</td><td>${esc(i.model)}</td><td style="text-align:right;font-weight:700">${num(i.qty)}</td><td>${esc(unitByName(i.model))}</td><td></td></tr>`).join('')}</tbody></table>` : '';
+  const itTotal = its.length ? ` · ของใช้ ${num(its.reduce((a, i) => a + i.qty, 0))} ชิ้น` : '';
+  const items = [...docDev(d)].sort((a, b) => (a.model || '').localeCompare(b.model || '', 'th')), n = items.length;
   const groups = new Map(); items.forEach(i => { const k = i.model || '-'; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(i); });
   const who = iss ? 'ผู้เบิก / ผู้รับเครื่อง' : 'ผู้คืนเครื่อง';
   const sign = iss ? signBox('ผู้รับเครื่อง', 'ผู้จ่ายเครื่อง') : signBox('ผู้คืนเครื่อง', 'ผู้รับคืน');
@@ -1537,9 +1633,9 @@ async function printDoc(no, mode = 'table') {
       <div class="mi">${d.missing.map(m => `<span>${esc(imeiFmt(m.imei))} · ${esc(m.model || '-')}</span>`).join('')}</div></div>` : '';
     const sold = !iss && d.sold?.length ? `<div class="miss sold"><div class="mh">ขายแล้ว ${d.sold.length} เครื่อง<span>ปิดรายการ ไม่คืนเข้าสต็อก</span></div>
       <div class="mi">${d.sold.map(m => `<span>${esc(imeiFmt(m.imei))} · ${esc(m.model || '-')}</span>`).join('')}</div></div>` : '';
-    const head = sheetHead({ title, en, no: d.doc_no, sub: `${n} เครื่อง · ${groups.size} รุ่น${d.req_no ? ' · อ้างอิงคำขอ ' + esc(d.req_no) : ''}` });
+    const head = sheetHead({ title, en, no: d.doc_no, sub: `${n} เครื่อง · ${groups.size} รุ่น${its.length ? ` · อุปกรณ์ ${its.length} รายการ` : ''}${d.req_no ? ' · อ้างอิงคำขอ ' + esc(d.req_no) : ''}` });
     if (!n) {
-      body = `<section>${sheetHead({ title, en, no: d.doc_no, sub: 'ไม่มีเครื่องคืนเข้าคลัง' })}${metaGrid(metaCells, 4)}${sold}${miss}${sign}</section>`;
+      body = `<section>${sheetHead({ title, en, no: d.doc_no, sub: its.length ? `อุปกรณ์ ${its.length} รายการ${d.req_no ? ' · อ้างอิงคำขอ ' + esc(d.req_no) : ''}` : 'ไม่มีเครื่องคืนเข้าคลัง' })}${metaGrid(metaCells, 4)}${itTbl}${its.length ? `<div class="total"><span>รวมทั้งสิ้น<b>${num(its.reduce((a, i) => a + i.qty, 0))}</b>ชิ้น · ${its.length} รายการ</span></div>` : ''}${sold}${miss}${sign}</section>`;
     } else if (n + (groups.size > 1 ? groups.size : 0) <= 12) { // แบบตารางใหญ่ (มีช่องสภาพ/หมายเหตุ)
       let k = 0;
       body = `<section>${head}${metaGrid(metaCells, 4)}${pills}
@@ -1547,14 +1643,14 @@ async function printDoc(no, mode = 'table') {
       ${[...groups].map(([m, a]) => (groups.size > 1 ? `<tr class="grp"><td colspan="4">${esc(m)} <span>· ${a.length} เครื่อง</span></td></tr>` : '')
         + a.map(it => `<tr><td class="n">${String(++k).padStart(2, '0')}</td><td class="imei">${esc(imeiFmt(it.imei))}</td><td>${esc(it.model || '-')}</td><td></td></tr>`).join('')).join('')}
       </tbody></table>
-      <div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง</span></div>${sold}${miss}${sign}</section>`;
+      ${itTbl}<div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง${itTotal}</span></div>${sold}${miss}${sign}</section>`;
     } else {
       // แบบกะทัดรัด: จัดกลุ่มตามรุ่น · IMEI เรียง 4 คอลัมน์ (≈ 70–90 เครื่องจบใน A4 ใบเดียว)
       let k = 0;
       body = `<section class="cp">${head}${metaGrid(metaCells, 4)}
         ${[...groups].map(([m, a]) => `<div class="grp2"><div class="gh"><b>${esc(m)}</b><span>${a.length} เครื่อง</span></div>
           <div class="ig">${a.map(it => `<div class="ic"><i class="box"></i><span class="n">${String(++k).padStart(2, '0')}</span><span class="imei">${esc(imeiFmt(it.imei))}</span></div>`).join('')}</div></div>`).join('')}
-        <div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง · ${groups.size} รุ่น</span></div>${sold}${miss}${sign}</section>`;
+        ${itTbl}<div class="total"><span>รวมทั้งสิ้น<b>${n}</b>เครื่อง · ${groups.size} รุ่น${itTotal}</span></div>${sold}${miss}${sign}</section>`;
     }
   }
   writePrint(w, d.doc_no, body);
@@ -1570,18 +1666,26 @@ const actions = {
   confirmReturn: () => {
     const sold = retMissing().filter(l => retSold.has(l.imei)).map(l => l.imei);
     const keep = retMissing().filter(l => !retSold.has(l.imei)).map(l => l.imei);
-    if (!state.cart.return.length && !sold.length) { toast('ยังไม่มีเครื่องที่คืนหรือขาย', true); return; }
+    const ikeep = retIMissing().filter(l => !retLost.has(l.id));
+    const iany = retILoans().some(l => retIGot(l.id) > 0) || retLost.size;
+    if (!state.cart.return.length && !sold.length && !iany) { toast('ยังไม่มีเครื่องหรือของที่คืน', true); return; }
     const reason = ($('#missReason')?.value || '').trim();
-    if (keep.length && !reason) { const i = $('#missReason'); if (i) { i.setCustomValidity('กรุณาระบุเหตุผล หรือเลือกจากตัวเลือกด้านล่าง'); i.reportValidity(); i.oninput = () => i.setCustomValidity(''); } return; }
-    doReturn(keep, keep.length ? reason : '', sold);
+    if ((keep.length || ikeep.length || retLost.size) && !reason) { const i = $('#missReason'); if (i) { i.setCustomValidity('กรุณาระบุเหตุผล หรือเลือกจากตัวเลือกด้านล่าง'); i.reportValidity(); i.oninput = () => i.setCustomValidity(''); } return; }
+    doReturn(keep, reason, sold);
   },
-  pickPerson: d => { if (state.retPerson !== d.p) { state.retPerson = d.p; state.cart.return = []; saveDraft(); } renderRetAll(); },
+  toggleLost: d => { const id = +d.id; retLost.has(id) ? retLost.delete(id) : retLost.add(id); renderMissDlg(); },
+  retIQ: d => { const l = state.iopen.find(x => x.id === +d.id); if (!l) return; const rem = ilRem(l);
+    const v = d.d === 'all' ? (retIGot(l.id) >= rem ? 0 : rem) : Math.max(0, Math.min(rem, retIGot(l.id) + +d.d));
+    if (v) state.retItems[l.id] = v; else delete state.retItems[l.id]; saveDraft(); renderRet(); },
+  fulQ: d => { const r = curReq(), l = r?.request_items.find(x => x.model_id === +d.id); if (!l) return; const cur = state.ful.qty[l.model_id] || 0;
+    state.ful.qty[l.model_id] = d.d === 'all' ? (cur >= l.qty ? 0 : l.qty) : Math.max(0, Math.min(l.qty, cur + +d.d)); saveDraft(); renderFul(); },
+  pickPerson: d => { if (state.retPerson !== d.p) { state.retPerson = d.p; state.cart.return = []; state.retItems = {}; saveDraft(); } renderRetAll(); },
   retClear: () => {
     if (state.cart.return.length && !confirm(`ยิงไปแล้ว ${state.cart.return.length} เครื่อง — เปลี่ยนผู้เบิกจะล้างรายการที่ยิงไว้`)) return;
-    state.retPerson = ''; state.cart.return = []; state.retQ = ''; saveDraft(); renderRetAll();
+    state.retPerson = ''; state.cart.return = []; state.retItems = {}; state.retQ = ''; saveDraft(); renderRetAll();
   },
   retPerson: d => {
-    if (state.retPerson !== d.p) { state.retPerson = d.p; state.cart.return = []; saveDraft(); }
+    if (state.retPerson !== d.p) { state.retPerson = d.p; state.cart.return = []; state.retItems = {}; saveDraft(); }
     if (dlg().open) dlg().close();
     go('return');
   },
@@ -1614,6 +1718,20 @@ const actions = {
     state.newModel = ''; state.newQty = ''; await refresh(); render(); toast('เพิ่มรุ่น ' + name);
   }),
   stockDlg: d => stockDlg(d.id),
+  stockTab: d => { state.stockTab = d.t; state.sq = ''; render(); },
+  niRet: d => { state.newItem.ret = d.v === '1'; document.querySelectorAll('[data-act=niRet]').forEach(b => b.classList.toggle('on', b.dataset.v === d.v)); },
+  addItem: () => guarded(async () => {
+    const ni = state.newItem, name = ni.name.trim(), qty = Math.floor(+ni.qty || 0);
+    if (!name) return toast('กรุณาระบุชื่อ', true);
+    if (qty < 0) return toast('จำนวนต้องไม่ติดลบ', true);
+    await rpc('item_save', { p_id: null, p_name: name, p_unit: ni.unit.trim() || 'ชิ้น', p_returnable: ni.ret, p_active: true, p_stock: qty, p_by: opName() });
+    state.newItem = { name: '', unit: '', qty: '', ret: ni.ret }; await refresh(); render(); toast('เพิ่ม ' + name);
+  }),
+  itemDlg: d => itemDlg(d.id),
+  saveItem: d => guarded(async () => {
+    await rpc('item_save', { p_id: +d.id, p_name: $('#iName').value, p_unit: $('#iUnit').value, p_returnable: $('#iRet').checked, p_active: $('#iActive').checked, p_stock: null, p_by: opName() });
+    dlg().close(); await loadModels(); renderStockList(); toast('บันทึกแล้ว');
+  }),
   personDlg: d => personDlg(d.p),
   actSave: () => actSave(false),
   actAtClear: () => { state.actAt = ''; actReadForm(); state.actAt = ''; const fe = $('#actForm'); if (fe) fe.innerHTML = actFormHtml(); },
@@ -1872,6 +1990,12 @@ addEventListener('unhandledrejection', e => showError(e.reason));
 function onBind(e) {
   const t = e.target;
   if (t.dataset.qty) { if (e.type === 'input') setQty(+t.dataset.qty, t.value, false); else setQty(+t.dataset.qty, t.value); return; }
+  if (t.dataset.fulq) { const l = curReq()?.request_items.find(x => x.model_id === +t.dataset.fulq); if (!l) return;
+    state.ful.qty[l.model_id] = Math.max(0, Math.min(l.qty, Math.floor(+t.value || 0))); saveDraft();
+    if (e.type === 'change') renderFul(); else { const b = $('#fulSum'); if (b) b.innerHTML = fulSumHtml(); } return; }
+  if (t.dataset.reti) { const l = state.iopen.find(x => x.id === +t.dataset.reti); if (!l) return;
+    const v = Math.max(0, Math.min(ilRem(l), Math.floor(+t.value || 0))); if (v) state.retItems[l.id] = v; else delete state.retItems[l.id]; saveDraft();
+    if (e.type === 'change') renderRet(); else { const b = $('#retSum'); if (b) b.innerHTML = retSumHtml(); } return; }
   if (t.classList?.contains('actck') && e.type === 'change') {
     const id = +t.dataset.id; if (!state.actSel) return; t.checked ? state.actSel.add(id) : state.actSel.delete(id); t.closest('.act-tr')?.classList.toggle('picked', t.checked); renderSelBar(); return;
   }
